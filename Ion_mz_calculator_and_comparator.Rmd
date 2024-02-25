@@ -2,6 +2,7 @@
 title: "Ion Calculator"
 output: html_notebook
 ---
+This was incorporated into, and updated in Disambiguator.Rmd
 
 Libraries & working directory
 
