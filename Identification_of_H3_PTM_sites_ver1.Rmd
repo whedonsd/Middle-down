@@ -1,0 +1,163 @@
+---
+title: "Middle-down Proteomics"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+setwd("C:/MS_Data/O2_Comet/R_Analysis")
+getwd()
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+1. Install and Load Necessary Libraries
+First, you need to install and then load the necessary libraries. If you haven't already installed these packages, do so using install.packages().
+
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(writexl)
+library(tidyr)
+```
+2. Read Your Spreadsheet Data
+Use readxl to read data from an Excel file. Replace 'your_spreadsheet.xlsx' with the path to your file and 'Sheet1' with the name of your sheet.
+
+```{r}
+df <- read_excel('293f_1to1_6plex_DMSO_MS275_2to15g_20240215_EBZ_Cole_20ng.xlsx', sheet = 'Sheet1')
+```
+
+3. Extract scan_number, charge, and hit_number from filename
+
+```{r}
+# Extract numbers into new columns
+df <- df %>%
+  extract(PSMId, into = c("scan_number", "charge", "hit_number"),
+          regex = ".*_(\\d+)_(\\d+)_(\\d+)$",
+          remove = FALSE) %>%
+  mutate(across(c(scan_number, charge, hit_number), as.integer))
+```
+
+4. Define template string
+
+```{r}
+template_str <- "ARTKQTARKSTGGKARPKQLATKAARKSAPATGGG"
+```
+
+5. Define a Function to Compare Strings
+You can create a function in R to compare each entry to a template string and identify the substitutions and their positions:
+
+```{r}
+analyze_insertions_adjusted <- function(template_str) {
+  # Pattern to match numerical values within square brackets
+  pattern <- "\\[(\\d+\\.\\d+)\\]"
+  
+  # Extract all matches
+  matches <- stringr::str_match_all(template_str, pattern)
+  
+  if (length(matches[[1]]) == 0) {
+    return(list(clean_string = template_str, insertions = NA, adjusted_positions = NA))
+  }
+  
+  # Initial positions of insertions before any removal
+  initial_positions <- stringr::str_locate_all(template_str, pattern)[[1]][, "start"]
+  
+  # Remove insertions from the string to obtain a clean comparison string
+  string_no_insertions <- stringr::str_replace_all(template_str, pattern, "")
+  
+  # Recalculate the adjusted positions
+  # For each insertion, subtract the length of all previous insertions from its original position
+  adjusted_positions <- initial_positions
+  for (i in 2:length(adjusted_positions)) {
+    adjusted_positions[i] <- adjusted_positions[i] - sum(nchar(matches[[1]][1:(i-1), 1]))
+  }
+  
+  list(
+    clean_string = string_no_insertions,
+    insertions = matches[[1]][, 2], # Second column contains the numerical values
+    adjusted_positions = adjusted_positions
+  )
+}
+```
+
+6. Linking results to scan_number
+When creating the results list, you currently don't track which scan_number each result corresponds to. Since you iterate over df$peptide, you lose the association with scan_number. To maintain this association, consider including the scan_number within each list element of results:
+
+```{r}
+results <- lapply(seq_along(df$peptide), function(i) {
+  list(
+    scan_number = df$scan_number[i],
+    analysis = analyze_insertions_adjusted(df$peptide[i])
+  )
+})
+```
+
+
+```{r}
+# Assuming 'results' is your list containing the analysis results
+expanded_results <- lapply(results, function(x) {
+  if (length(x$analysis$insertions) > 0) {
+    data.frame(
+      scan_number = rep(x$scan_number, length(x$analysis$insertions)),
+      clean_string = rep(x$analysis$clean_string, length(x$analysis$insertions)),
+      insertion = x$analysis$insertions,
+      position = x$analysis$adjusted_positions
+    )
+  } else { # If there are no insertions, create a row indicating this
+    data.frame(
+      scan_number = x$scan_number,
+      clean_string = x$analysis$clean_string,
+      insertion = NA,
+      position = NA
+    )
+  }
+})
+
+# Combine all the individual dataframes into one
+final_df <- bind_rows(expanded_results)
+
+final_df <- final_df %>%
+  mutate(position = position - 1)
+```
+
+Creating a lookup dataframe to convert numerical representations of PTMs into text representations
+```{r}
+# Example lookup dataframe
+lookup_PTM_df <- data.frame(
+  insertion_num = c(14.0157, 28.0313, 42.0470, 42.0106, 56.0262, 79.9663, 86.0368), # Your numerical values
+  insertion_text = c("me1", "me2", "me3", "ac", "prop", "phos", "bhb") # Corresponding text descriptions
+)
+
+# Convert 'insertion' column in final_df to numeric
+final_df$insertion <- as.numeric(final_df$insertion)
+
+site_df <- data.frame(
+  site_num = c(2, 3, 4, 5, 6, 8, 9, 10, 11, 14, 17, 18, 19, 22, 23, 26, 27, 28, 31, 32), # Your numerical values
+  site_text = c("R", "T", "K", "Q", "T", "R", "K","S", "T", "K", "R", "K", "Q", "T", "K", "R", "K", "S", "S", "T") # Corresponding text descriptions
+)
+
+seq_df <- data.frame(
+  seq_num = c(2, 3, 4, 5, 6, 8, 9, 10, 11, 14, 17, 18, 19, 22, 23, 26, 27, 28, 31, 32), # Your numerical values
+  seq_text = c("2", "3", "4", "5", "6", "8", "9", "10", "11", "14", "17", "18", "19", "22", "23", "26", "27", "28", "31", "32") # Corresponding text descriptions
+)
+
+# Then, perform the left join
+final_joined_df <- final_df %>%
+  left_join(site_df, by = c("position" = "site_num")) %>%
+  left_join(seq_df, by = c("position" = "seq_num")) %>%
+  left_join(lookup_PTM_df, by = c("insertion" = "insertion_num")) %>%
+  mutate(concatenated_column = paste(site_text, seq_text, insertion_text, sep = ""))
+```
+
+```{r}
+write_xlsx(final_joined_df, 'H31_PTMs.xlsx')
+```
+

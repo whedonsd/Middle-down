@@ -1,0 +1,343 @@
+---
+title: "Ion Calculator"
+output: html_notebook
+---
+
+Libraries & working directory
+
+```{r}
+directory <- c("C:/TPP/data/test")
+setwd(directory)
+
+library(Spectra)
+library(mzR)
+library(stringr)
+library(readxl)
+library(dplyr)
+library(xml2)
+
+# Replace 'path_to_your_excel_file.xlsx' with the actual path to your Excel file
+# excel file should contain scan numbers and peptide sequences following the unusual format described below
+# excel_data <- read_excel('path_to_your_excel_file.xlsx')
+# Enter the path to your proteomics data. This should include your mzML.gz, .raw, pep.xml and .PIN files
+
+my_pep_xml <- c("20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad.pep.xml")
+
+# Load your XML data
+peptide_data <- read_xml(my_pep_xml)
+
+# Replace 'd1' and its URI with the correct namespace prefix and URI if your XML uses namespaces
+ns <- xml_ns_rename(xml_ns(peptide_data), c(d1 = "d1"))
+```
+
+Step 1: Define Masses of Amino Acids and Atoms
+Start by defining the monoisotopic masses for amino acids and the relevant atomic masses. This will serve as the foundation for all subsequent calculations.
+
+```{r}
+# Monoisotopic masses of amino acids
+amino_acid_masses <- c(
+  A = 71.03711, R = 156.10111, N = 114.04293, D = 115.02694,
+  C = 103.00919, E = 129.04259, Q = 128.05858, G = 57.02146,
+  H = 137.05891, I = 113.08406, L = 113.08406, K = 128.09496,
+  M = 131.04049, F = 147.06841, P = 97.05276, S = 87.03203,
+  T = 101.04768, W = 186.07931, Y = 163.06333, V = 99.06841
+)
+
+# Atomic masses for elements (Monoisotopic)
+atomic_masses <- c(
+  C = 12.0, c = 13.0033548378, H = 1.007825, N = 14.003074, n = 15.0001088982, O = 15.994915, P = 30.973762, S = 31.972071
+)
+
+# PTMs
+amino_acid_masses["a"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 2 + atomic_masses["H"] * 2 + atomic_masses["O"]) # Kac
+amino_acid_masses["1"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 1 + atomic_masses["H"] * 2) # Kme1
+amino_acid_masses["2"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 2 + atomic_masses["H"] * 4) # Kme2
+amino_acid_masses["3"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 3 + atomic_masses["H"] * 6) # Kme3
+amino_acid_masses["m"] <- amino_acid_masses["R"] + (atomic_masses["C"] * 1 + atomic_masses["H"] * 2) # Rme1
+amino_acid_masses["d"] <- amino_acid_masses["R"] + (atomic_masses["C"] * 2 + atomic_masses["H"] * 4) # Rme2
+amino_acid_masses["s"] <- amino_acid_masses["S"] + (atomic_masses["P"] + atomic_masses["H"] * 2 + atomic_masses["O"] * 3) # Sphos
+amino_acid_masses["t"] <- amino_acid_masses["S"] + (atomic_masses["P"] + atomic_masses["H"] * 2 + atomic_masses["O"] * 3) # Sphos
+amino_acid_masses["p"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 3 + atomic_masses["H"] * 5 + atomic_masses["O"]) # Kprop
+amino_acid_masses["b"] <- amino_acid_masses["K"] + (atomic_masses["C"] * 4 + atomic_masses["H"] * 6 + atomic_masses["O"] * 2) # Kbhb
+amino_acid_masses["c"] <- amino_acid_masses["G"] + amino_acid_masses["K"] + (atomic_masses["C"] * 11 + atomic_masses["c"] * 4 + atomic_masses["H"] * (28 - 1) + atomic_masses["O"] * (3 - 1) + atomic_masses["N"] * 4 + atomic_masses["n"] * 1) # c-term tmt mod
+
+print(amino_acid_masses)
+
+# Adjustments for ion types
+ion_type_adjustments <- list(
+  b = 0, # [N]+[M]-H  ; N = mass of neutral N terminal group
+  y = atomic_masses["H"] * (2) + atomic_masses["O"], # Neutral mass = [C]+[M]+H ; C = mass of neutral C-terminal group (OH)
+  c = atomic_masses["H"] + (atomic_masses["H"] * (2) + atomic_masses["N"]), # [N]+[M]+NH2  ; N = mass of neutral N terminal group
+  z = atomic_masses["O"] - atomic_masses["N"] # Neutral mass = [C]+[M]-NH2 ; C = mass of neutral C-terminal group (OH)
+	# We're really printing Z-dot ions so we add an H to make it OH+[M]-NH2 +H = [M]+O-N
+)
+```
+
+Step 1: Define Necessary Constants and Functions
+First, ensure you have defined all the necessary constants, including amino acid and atomic masses, as well as functions for calculating peptide and ion masses.
+
+```{r}
+calculate_fragment_mass_from_sequence <- function(sequence) {
+  mass <- sum(sapply(strsplit(sequence, "")[[1]], function(aa) {
+    if (aa %in% names(amino_acid_masses)) {
+      return(amino_acid_masses[[aa]])
+    } else {
+      stop(paste("Undefined amino acid or modification:", aa))
+    }
+  }))
+  return(mass)
+}
+
+# Function to calculate m/z for ions
+calculate_ion_mz <- function(peptide_mass, charge) {
+  # Adjust mass for ion type and add protons for charge
+  mz <- (peptide_mass + atomic_masses["H"] * charge) / charge
+  return(mz)
+}
+
+generate_ions_for_sequence <- function(sequence) {
+  ions_list <- list()
+  
+  sequence_length <- nchar(sequence)
+  for (charge in 1:6) {
+    b_ions <- numeric(sequence_length - 1)
+    y_ions <- numeric(sequence_length - 1)
+    c_ions <- numeric(sequence_length - 1)
+    z_ions <- numeric(sequence_length - 1)
+    
+    for (i in 1:(sequence_length - 1)) {
+      b_seq <- substr(sequence, 1, i)
+      y_seq <- substr(sequence, i + 1, sequence_length)
+      
+      # Calculate the mass of the b, y, c, z ion sequences
+      b_mass <- calculate_fragment_mass_from_sequence(b_seq) + ion_type_adjustments$b
+      y_mass <- calculate_fragment_mass_from_sequence(y_seq) + ion_type_adjustments$y
+      c_mass <- calculate_fragment_mass_from_sequence(b_seq) + ion_type_adjustments$c
+      z_mass <- calculate_fragment_mass_from_sequence(y_seq) + ion_type_adjustments$z
+      
+      # Calculate the m/z for b, y, c, z ions. Note the adjustment for ion type is now applied in the mass calculation
+      b_ions[i] <- calculate_ion_mz(b_mass, charge)
+      y_ions[i] <- calculate_ion_mz(y_mass, charge)
+      c_ions[i] <- calculate_ion_mz(c_mass, charge)
+      z_ions[i] <- calculate_ion_mz(z_mass, charge)
+    }
+    
+    # Populate ions_list with b, y, c, and z ions (c and z ions omitted for brevity)
+    ions_list[[paste("b_ions_charge", charge)]] <- b_ions
+    ions_list[[paste("y_ions_charge", charge)]] <- y_ions
+    ions_list[[paste("c_ions_charge", charge)]] <- c_ions
+    ions_list[[paste("z_ions_charge", charge)]] <- z_ions
+  }
+  
+  return(ions_list)
+}
+```
+
+Step 2: Generate Ions and Store in Vectors
+You will need to iterate over the peptide sequence to generate b and y ions (and similarly c and z ions if desired) for each charge state from +1 to +6. Here, we focus on generating b and y ions as examples.
+
+```{r}
+# Example usage for a peptide sequence
+peptide_sequence <- "ARTKQTARaSTGG2APRKQLATKAAR2SAPATGGc"
+ions <- as.data.frame(generate_ions_for_sequence(peptide_sequence))
+ions_df <- ions_df %>%
+  mutate(across(starts_with("y_ions_charge"), rev)) %>%
+  mutate(across(starts_with("z_ions_charge"), rev))
+```
+
+Step 3: Compare Against Mass Spectrum
+Assuming you have a numerical list from a mass spectrum, you can compare the generated ion vectors to this list. Here’s a simple way to find matches within a specified tolerance:
+
+```{r}
+# Define fn to calculate tolerance
+calculate_tolerance <- function(mz, ppm) {
+  return(as.numeric(mz) * ppm / 1e6)
+}
+
+find_matches_with_intensity_df <- function(ions_df, scan_data, ppm_tolerance, sequence) {
+  matches <- list()
+  sequence_length <- nchar(sequence)
+  half_sequence_length <- floor(sequence_length * 0.5)
+  
+  # Identify ion type columns in the dataframe
+  ion_columns <- names(ions_df)
+  
+  for (ion_column in ion_columns) {
+    # Determine the charge state based on the column name
+    charge_state <- as.numeric(gsub(".*charge\\.(\\d+)$", "\\1", ion_column))
+    ion_vector <- ions_df[[ion_column]]
+    
+    for (i in seq_along(ion_vector)) {
+      # Skip condition for +1 charge state ions if their position is greater than half the sequence length
+      if (charge_state == 1 && i > half_sequence_length) {
+        next
+      }
+
+      # Additional conditions for other charge states if needed
+      # Example for +3 charge state (you can add logic inside the block)
+      else if (charge_state == 3 && i < 2) {
+        # Specific logic for +3 charge state ions
+      }
+      
+      # Condition for +4 charge state ions
+      else if (charge_state == 4 && i < 3) {
+      # Apply specific logic for +2 charge state ions
+      # You can add more specific conditions for +2 charge state ions here
+      }
+      
+      # Condition for +5 charge state ions
+      else if (charge_state == 5 && i < 4) {
+      # Apply specific logic for +2 charge state ions
+      # You can add more specific conditions for +2 charge state ions here
+      }
+      
+      # Condition for +5 charge state ions
+      else if (charge_state == 6 && i < 4) {
+      # Apply specific logic for +2 charge state ions
+      # You can add more specific conditions for +2 charge state ions here
+      }
+      
+      ion_mass <- ion_vector[i]
+      ion_tolerance <- calculate_tolerance(ion_mass, ppm_tolerance)
+      
+      # Find indices of matching m/z values within tolerance
+      matching_indices <- which(abs(scan_data[, "mz"] - ion_mass) <= ion_tolerance)
+      
+      if (length(matching_indices) > 0) {
+        # For each matching index, capture the intensity
+        intensities <- scan_data[matching_indices, "intensity"]
+        # Construct a key for this match, including the column name and ion position
+        match_key <- paste(ion_column, "pos", i, round(ion_mass, 4), sep = "_")
+        # Store matches with their intensities
+        matches[[match_key]] <- list(mz = scan_data[matching_indices, "mz"], intensity = intensities)
+      }
+    }
+  }
+  
+  return(matches)
+}
+
+```
+
+Key Points:
+Charge State Detection: The function now includes logic to determine the charge state from the column name. This uses a regular expression with gsub() to extract the charge state number from the column name pattern like "y_ions_charge.1". Adjust the pattern as necessary to match your dataframe's column naming convention.
+
+Biochemical Rule Application: Before proceeding with the match finding for each ion, it checks if the ion is in the +1 charge state and if its position is greater than half the length of the sequence. If both conditions are met, the next statement skips the rest of the current iteration, effectively filtering out these ions from the match list.
+
+Sequence Length Consideration: The function now requires the sequence parameter to calculate the sequence length and thereby apply the biochemical rule accurately.
+
+This approach allows you to integrate specific biochemical rules into the process of identifying and retaining meaningful matches, enhancing the biological relevance of your analysis results.
+---
+Extracting mzML spectrum data with Spectra and mzR
+https://rformassspectrometry.r-universe.dev/articles/Spectra/Spectra.html
+
+```{r}
+setwd("C:/TPP/data/293f_2to15_DMSO_MS275_1to1_6plex")
+mz <- openMSfile("20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad.mzML.gz")
+p <- peaks(mz) ## extract all peak information
+scan2012 <- peaks(mz, scan=2012)
+
+scan2012 <- as.data.frame(scan2012)
+
+ppm_tolerance <- 20 # Define your ppm tolerance
+matches_with_intensity <- find_matches_with_intensity(ions_df, scan2012, ppm_tolerance)
+
+# Initialize lists to hold extracted data
+ion_type_list <- c()
+ion_position_list <- c()
+ion_mz_list <- c()
+match_mz_list <- c()
+match_intensity_list <- c()
+
+# Iterate through matches to extract data
+for (match_key in names(matches_with_intensity)) {
+  # Correctly split the match_key to extract details
+  details <- unlist(strsplit(match_key, "_pos_")) # Split at "_pos_"
+  ion_type_and_charge <- details[1] # This is the ion type and charge
+  pos_and_mz <- unlist(strsplit(details[2], "_")) # Further split to separate position from m/z
+  ion_position <- as.numeric(pos_and_mz[1]) # This is the position
+  ion_mz <- as.numeric(pos_and_mz[2]) # This is the ion m/z
+  
+  # Extract matched m/z and intensity from each match
+  for (i in seq_along(matches_with_intensity[[match_key]]$mz)) {
+    ion_type_list <- c(ion_type_list, ion_type_and_charge)
+    ion_position_list <- c(ion_position_list, ion_position)
+    ion_mz_list <- c(ion_mz_list, ion_mz)
+    match_mz_list <- c(match_mz_list, matches_with_intensity[[match_key]]$mz[i])
+    match_intensity_list <- c(match_intensity_list, matches_with_intensity[[match_key]]$intensity[i])
+  }
+}
+
+# Combine the lists into a dataframe
+matches_df <- data.frame(
+  IonType = ion_type_list,
+  IonPosition = ion_position_list,
+  IonMZ = ion_mz_list,
+  MatchMZ = match_mz_list,
+  MatchIntensity = match_intensity_list
+)
+```
+
+Instructions for iterating over data set
+
+```{r}
+# Assuming 'mz' is already opened using openMSfile
+results <- list()
+
+for (i in 1:nrow(excel_data)) {
+  scan_number <- excel_data$ScanNumber[i]
+  peptide_sequence <- excel_data$PeptideSequence[i]
+  
+  # Generate scan data frame
+  scan_data <- as.data.frame(peaks(mz, scan = scan_number))
+  
+  # Generate ions for peptide sequence
+  ions_df <- as.data.frame(generate_ions_for_sequence(peptide_sequence))
+  ions_df <- ions_df %>%
+  mutate(across(starts_with("y_ions_charge"), rev)) %>%
+  mutate(across(starts_with("z_ions_charge"), rev))
+  
+  # Find matches
+  ppm_tolerance <- 20 # Define your ppm tolerance
+  matches_with_intensity <- find_matches_with_intensity(ions_df, scan_data, ppm_tolerance)
+  
+  # Iterate through matches to extract data
+  for (match_key in names(matches_with_intensity)) {
+    # Correctly split the match_key to extract details
+    details <- unlist(strsplit(match_key, "_pos_")) # Split at "_pos_"
+    ion_type_and_charge <- details[1] # This is the ion type and charge
+    pos_and_mz <- unlist(strsplit(details[2], "_")) # Further split to separate position from m/z
+    ion_position <- as.numeric(pos_and_mz[1]) # This is the position
+    ion_mz <- as.numeric(pos_and_mz[2]) # This is the ion m/z
+  
+    # Extract matched m/z and intensity from each match
+    for (i in seq_along(matches_with_intensity[[match_key]]$mz)) {
+      ion_type_list <- c(ion_type_list, ion_type_and_charge)
+      ion_position_list <- c(ion_position_list, ion_position)
+      ion_mz_list <- c(ion_mz_list, ion_mz)
+      match_mz_list <- c(match_mz_list, matches_with_intensity[[match_key]]$mz[i])
+      match_intensity_list <- c(match_intensity_list, matches_with_intensity[[match_key]]$intensity[i])
+    }
+  }
+
+  # Combine the lists into a dataframe
+  matches_df <- data.frame(
+    IonType = ion_type_list,
+    IonPosition = ion_position_list,
+    IonMZ = ion_mz_list,
+    MatchMZ = match_mz_list,
+    MatchIntensity = match_intensity_list
+  )
+  
+  # Store results
+  results[[paste("Scan", scan_number)]] <- matches_df
+  
+  # Optional: Clear memory of temporary objects
+  rm(scan_data, ions, matches_with_intensity, matches_df)
+}
+
+# Process 'results' as needed, e.g., save to files or further analysis
+```
+
+
+

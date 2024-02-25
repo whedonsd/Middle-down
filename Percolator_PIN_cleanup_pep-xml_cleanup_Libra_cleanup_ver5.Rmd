@@ -1,0 +1,333 @@
+---
+title: "Middle-down Proteomics Data Processing"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Load Libaries
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(writexl)
+library(tidyr)
+library(xml2)
+library(XML)
+library(readr)
+```
+
+1.Correct pep.xml filepaths
+Running comet on O2 produces pep.xml outputs with O2 file structure filepaths
+Update thes filepaths to reflect where you are storing the data on your computer
+
+```{r}
+# Enter the path to your proteomics data. This should include your mzML.gz, .raw, pep.xml and .PIN files
+directory <- c("C:/TPP/data/test")
+my_pep_xml <- c("20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad.pep.xml")
+
+setwd(directory)
+
+# Load your XML data
+peptide_data <- read_xml(my_pep_xml)
+
+# Replace 'd1' and its URI with the correct namespace prefix and URI if your XML uses namespaces
+ns <- xml_ns_rename(xml_ns(peptide_data), c(d1 = "d1"))
+
+# Define the incorrect base path you want to replace
+incorrect_base_path <- "/home/sdw17/sam/comet_project_2023/293f_2to15_DMSO_MS275_1to1_6plex"
+
+# List of node paths and their corresponding attributes to update
+nodes_to_update <- list(
+  c("/d1:msms_pipeline_analysis", "summary_xml"),
+  c("//d1:msms_run_summary", "base_name"),
+  c("//d1:msms_run_summary/d1:search_summary", "base_name"),
+  c("//d1:msms_run_summary/d1:search_summary", "database_name"),
+  c("//d1:msms_run_summary/d1:search_summary/d1:search_database", "local_path"),
+  c("//d1:msms_run_summary/d1:search_summary/d1:parameter[@name='database_name']", "value")
+)
+
+# Function to update the file path, preserving the file name
+update_file_path <- function(node, attribute_name) {
+  old_path <- xml_attr(node, attribute_name)
+  if (!is.null(old_path) && grepl("^/", old_path)) { # Check if path starts with "/" indicating an absolute path to replace
+    # Extract the file name from the old path
+    file_name <- basename(old_path)
+    # Create the new path by appending the file name to the new directory
+    new_path <- file.path(directory, file_name)
+    # Update the attribute with the new path
+    xml_set_attr(node, attribute_name, new_path)
+  }
+}
+
+# Iterate over the list of nodes and attributes to update
+for (path_attr in nodes_to_update) {
+  # Extract node path and attribute name
+  node_path <- path_attr[1]
+  attribute_name <- path_attr[2]
+  
+  # Find nodes based on the provided path
+  nodes <- xml_find_all(peptide_data, node_path, ns)
+  
+  # Apply updates to each node found
+  for (node in nodes) {
+    update_file_path(node, attribute_name)
+  }
+}
+
+# Find the <msms_run_summary> nodes
+msms_run_summary_nodes <- xml_find_all(peptide_data, "//d1:msms_run_summary", ns)
+
+# Update the 'raw_data' attribute for each node
+for (node in msms_run_summary_nodes) {
+  xml_set_attr(node, "raw_data", ".mzML")
+}
+
+# Save the modified XML with corrected filepaths
+write_xml(peptide_data, my_pep_xml)
+```
+
+
+
+```{r}
+# set working directory
+setwd(directory)
+
+# Read the .PIN file into R
+PIN <- read.delim("20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad.pin")
+
+# Read the pep.xml with modified filepaths
+peptide_data <- read_xml(my_pep_xml)
+
+# Replace 'd1' and its URI with the correct namespace prefix and URI if your XML uses namespaces
+ns <- xml_ns_rename(xml_ns(peptide_data), c(d1 = "d1"))
+
+# Find all <spectrum_query> nodes
+spectrum_queries <- xml_find_all(peptide_data, "//d1:spectrum_query", ns)
+
+# Initialize a vector or list to store the pairs of scan number and retention time in seconds
+start_scan_retention_time_pairs <- vector("list", length(spectrum_queries))
+
+# Extract attributes
+for (i in seq_along(spectrum_queries)) {
+  node <- spectrum_queries[[i]]
+  start_scan_value <- xml_attr(node, "start_scan")
+  retention_time_value <- xml_attr(node, "retention_time_sec")
+  
+# Store the pair
+  start_scan_retention_time_pairs[[i]] <- c(start_scan = start_scan_value, retention_time_sec = retention_time_value)
+}
+
+# Initialize an empty dataframe to store the pairs
+pairs_df <- data.frame(start_scan = character(), retention_time_sec = character(), stringsAsFactors = FALSE)
+
+# Populate the dataframe
+for (node in spectrum_queries) {
+  start_scan_value <- xml_attr(node, "start_scan")
+  retention_time_value <- xml_attr(node, "retention_time_sec")
+  
+# Append to the dataframe
+pairs_df <- rbind(pairs_df, data.frame(start_scan = start_scan_value, retention_time_sec = retention_time_value, stringsAsFactors = FALSE))
+}
+
+# Optional: Convert the columns to the appropriate data types
+pairs_df$start_scan <- as.numeric(pairs_df$start_scan)
+pairs_df$retention_time_sec <- as.numeric(pairs_df$retention_time_sec)
+
+# Adding retention time in seconds to the PIN file, in the column immediately to the right of the ScanNr column is required for Percolator to use -docdRT or -docdMdRT flags, which prime the SVN to train on retention time based features
+PIN <- left_join(PIN, pairs_df, by = c("ScanNr" = "start_scan"))
+
+# Percolator only recognizes the retention time column when named 'rt'
+names(PIN)[names(PIN) == "retention_time_sec"] <- "rt"
+
+# Comet creates a reversed decoy library of all sequences in the fasta, which results in misattribution of the fasta file decoys as true hits. This corrects for that. 
+PIN <- PIN %>%
+  mutate(newColumn = if_else(str_starts(Proteins, "DECOY_"), -1, 1))
+
+# Clears the old column designating hits and decoys
+PIN$Label <- NULL
+
+# Designates the new column containing and decoy designations
+names(PIN)[names(PIN) == "newColumn"] <- "Label"
+
+# restructers PIN table
+PIN <- PIN %>%
+  select(SpecId, Label, ScanNr, rt, dM, absdM, everything())
+
+write_delim(PIN, "C:/TPP/data/293f_2to15_DMSO_MS275_1to1_6plex/20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad_R-reclassified_pin.txt", delim = "\t")
+```
+
+Go to the Trans-Proteomic Pipeline
+Use Percolator to process your tab delimited .txt file
+Use flags -Y -U -D 15 -V -docdMdRT -O
+This takes a few minutes depending on your hardware
+Read in the result 'pin.tsv' file below
+
+```{r}
+# set working directory
+setwd(directory)
+
+# Read the Percolator output into a data.frame
+PSM_df <- read_tsv("C:/TPP/data/293f_2to15_DMSO_MS275_1to1_6plex/20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad_R-reclassified_pin.tsv")
+
+# Extract scan numbers, charge state and hit number information from the PSMId column into new columns
+PSM_df <- PSM_df %>%
+  extract(PSMId, into = c("scan_number", "charge", "hit_rank"),
+          regex = ".*_(\\d+)_(\\d+)_(\\d+)$",
+          remove = FALSE) %>%
+  mutate(across(c(scan_number, charge, hit_rank), as.integer))
+
+# Combine scan_number and hit_rank into a single string to facilitate matching
+PSM_df$scan_hit_rank <- paste(PSM_df$scan_number, PSM_df$hit_rank, sep = "_")
+
+# Filter out peptides with PEP values >0.001
+PSM_df <- PSM_df %>% 
+  filter(posterior_error_prob <= 0.001)
+  
+# Extract the scan number column as a vector for filtering the pep.xml file read in at the beginning of the notebook
+PSM_scan_number <- PSM_df$scan_number
+
+# Filter the pep.xml data to only include PSMs with PEP<0.001
+removed_nodes_info <- data.frame(start_scan = character(), stringsAsFactors = FALSE)
+
+# Assuming peptide_data and ns are already defined
+spectrum_queries <- xml_find_all(peptide_data, "//d1:spectrum_query", ns)
+
+# Iterate through each spectrum_query
+for (spectrum_query in spectrum_queries) {
+  start_scan_value <- xml_attr(spectrum_query, "start_scan")
+  
+  # Find all search_hits within this spectrum_query
+  search_hits <- xml_find_all(spectrum_query, ".//d1:search_hit", ns)
+  
+  # Track if any search_hit meets the criteria
+  any_search_hit_matches <- FALSE
+  
+  for (search_hit in search_hits) {
+    hit_rank_value <- xml_attr(search_hit, "hit_rank")
+    # Create a combined key to check against PSM_df$scan_hit_rank
+    scan_hit_key <- paste(start_scan_value, hit_rank_value, sep = "_")
+    
+    # Check if this search_hit's scan_hit_key is in PSM_df$scan_hit_rank
+    if (!(scan_hit_key %in% PSM_df$scan_hit_rank)) {
+      # If not, remove this search_hit
+      xml_remove(search_hit)
+    } else {
+      any_search_hit_matches <- TRUE
+    }
+  }
+  
+  # If no search_hit within this spectrum_query met the criteria, remove the spectrum_query
+  if (!any_search_hit_matches) {
+    xml_remove(spectrum_query)
+  }
+}
+
+# Key Adjustments:
+# Iterate Through <search_hit> Nodes: For each <spectrum_query>, the script now checks every <search_hit> to see if its combined start_scan and hit_rank (scan_hit_key) is present in PSM_df$scan_hit_rank.
+# If a <search_hit> does not match, it is removed.
+
+# Preserve Matching <spectrum_query>: Only <search_hit> nodes that do not match the scan_hit_rank criteria are removed.
+# If no <search_hit> nodes within a <spectrum_query> match, then the <spectrum_query> itself is removed.
+
+# This approach ensures that for each <spectrum_query>, only <search_hit> nodes that meet the specific start_scan and hit_rank criteria are preserved, aligning with your updated filtration requirements.
+
+# Assuming peptide_data and ns are already defined and filtered
+spectrum_queries <- xml_find_all(peptide_data, "//d1:spectrum_query", ns)
+
+# This re-labels PSM hit ranks according to Percolator's evaluation.
+# These have to be renumbered to 1 or Libra will not scan them for TMT ions.
+# Iterate through each spectrum_query
+for (spectrum_query in spectrum_queries) {
+  
+  # Find all search_hits within this spectrum_query
+  search_hits <- xml_find_all(spectrum_query, ".//d1:search_hit", ns)
+  
+  for (search_hit in search_hits) {
+    # Set the hit_rank attribute to "1" for each search_hit
+    xml_set_attr(search_hit, "hit_rank", "1")
+  }
+}
+
+write_xml(peptide_data, "Libra_input_pep.xml")
+```
+
+Go to the Trans-Proteomic Pipeline
+Use Analyze Peptides (PeptideProphet/xinteract) to process Libra_input_pep.xml
+Make sure that you have conditions.xml in the same folder as Libra_input_pep.xml
+In the Output Filename filed add the "R_Percolator_" prefix to the default "interact.pep.xml" filename
+Deselect all check boxes except "RUN Libra"
+Click the "RUN Xinteract" button
+When the Command window shows that file processing is complete proceed with the following
+
+---
+This function iterates through each <spectrum_query> and evaluates the <libra_result> nodes within. If any <libra_result> node within a <spectrum_query> meets the criteria (having five or more <intensity> nodes with absolute values other than "0.00"), the <spectrum_query> node is preserved. Otherwise, it's removed.
+
+```{r}
+# set working directory
+setwd(directory)
+
+Libra_peptide_data <- read_xml("R-Percolator_interact.pep.xml")
+
+# Filter the pep.xml to retain only PSMs with signal in >=5 TMT channels
+does_meet_preservation_criteria <- function(search_hit_node, ns) {
+  # Find all libra_result nodes within the search_hit_node
+  libra_result_nodes <- xml_find_all(search_hit_node, ".//d1:analysis_result/d1:libra_result", ns)
+  
+  for (libra_result_node in libra_result_nodes) {
+    intensity_nodes <- xml_find_all(libra_result_node, ".//d1:intensity", ns)
+    
+    # Count intensity nodes where absolute is not "0.00"
+    non_zero_absolute_count <- sum(xml_attr(intensity_nodes, "absolute") != "0.00")
+    
+    # Check if there are five or more such intensity nodes
+    if (non_zero_absolute_count >= 5) {
+      # Criteria for preservation met
+      return(TRUE)
+    }
+  }
+  
+  # Criteria for preservation not met
+  return(FALSE)
+}
+
+# Applying the updated criteria for preservation or removal of spectrum_query nodes
+spectrum_queries <- xml_find_all(Libra_peptide_data, "//d1:spectrum_query", ns)
+
+for (i in length(spectrum_queries):1) {
+  spectrum_query <- spectrum_queries[[i]]
+  search_hits <- xml_find_all(spectrum_query, ".//d1:search_hit", ns)
+  
+  # Initially assume spectrum_query does not meet preservation criteria
+  meets_preservation_criteria <- FALSE
+  
+  for (search_hit in search_hits) {
+    if (does_meet_preservation_criteria(search_hit, ns)) {
+      # If any search_hit meets the preservation criteria, mark the spectrum_query for preservation
+      meets_preservation_criteria <- TRUE
+      break # No need to check further search_hits
+    }
+  }
+  
+  # If the spectrum_query does not meet the preservation criteria, remove it
+  if (!meets_preservation_criteria) {
+    xml_remove(spectrum_query)
+  }
+}
+```
+
+Function Logic: The does_meet_preservation_criteria function checks if a given <search_hit> meets the criteria for preserving its parent <spectrum_query>. It returns TRUE if the criteria are met (at least one <libra_result> node has five or more <intensity> nodes with absolute values other than "0.00"), indicating that the <spectrum_query> should be preserved.
+
+Iterating and Decision Making: The outer loop iterates through each <spectrum_query>, checking all its <search_hit> nodes. If any <search_hit> meets the preservation criteria, the <spectrum_query> is preserved. Otherwise, it's removed.
+
+This approach ensures that only <spectrum_query> nodes failing to meet the updated criteria (fewer than five <intensity> nodes with absolute values other than "0.00" within any of their <libra_result> nodes) are removed, aligning the removal process with your specified requirements.
+
+```{r}
+# set working directory
+setwd(directory)
+
+# Print your new pep.xml file which contains only top Percolator PSMs with >=5 TMT reporter ions
+write_xml(Libra_peptide_data, "20240215_EBZ_Cole_20ng_293f_MS275vDMSO_1to1_6plex_2-15grad_R-percolator-PSMs_Libra-TMT_pipeline_pep.xml")
+```
