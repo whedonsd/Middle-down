@@ -1,0 +1,3351 @@
+---
+title: "Byonic Processing Notebook"
+output: html_notebook
+---
+---
+Libraries, constants & ion calculation functions
+---
+```{r}
+# Define file path to the folder containing your data
+directory <- c("C:/Users/your_file_path/")
+setwd(directory)
+
+# User defined variables
+# TMT 6-plex ETD ion masses
+TMT_ETD_mz_values <- c(114.127725, 115.124760, 116.134433, 117.131468, 118.141141, 119.138176)
+
+# TMT 6-plex ETD ion masses
+TMT_HCD_mz_values <- c(126.127726, 127.124761, 128.134436, 129.131471, 130.141145, 131.138180)
+
+# TMT 6-plex isotopic corrections
+# reference c(-2, -1, monoisotopic, +1, +2)
+TMT126 <- c(0, 0, 1, 0.076, 0)
+TMT127 <- c(0, 0, 1, 0.075, 0)
+TMT128 <- c(0, 0.015, 1, 0.056, 0)
+TMT129 <- c(0, 0.017, 1, 0.054, 0)
+TMT130 <- c(0, 0.034, 1, 0.035, 0)
+TMT131 <- c(0.007, 0.032, 1, 0.036, 0)
+# Anal. Chem. 2012, 84, 16, 7188–7194
+# reference calc: IC129 = IR129 - (IR128 * 0.017 + IR129 * 0.056)
+
+# Define maximum number of modifications per peptide
+max_mods <- 7
+
+# Define the posterior error probability (PEP) limit for Byonic/Percolator results
+PEP <- 0.05
+
+# Define the False Discovery Rates (FDR) limit for Byonic results
+#FDR <- 0.01
+
+# Define the minimum delta mod score
+min_delta_mod <- 10
+
+# Define your fragment mass error tolerance in parts per million (ppm)
+ppm_tolerance <- 15 
+
+# Define the minimum intensity threshold at which isotopic checking of fragment ions is performed
+#min_int_threshold <- 0.005
+
+# Define whether to consider PSMs hits that are ambiguous based on detected ions
+#unambiguous <- TRUE
+
+# Define amino acid used for TMT mass tag entry in Byonic 
+aa_tag <- "H"
+
+library(parallel)
+library(purrr)
+library(mzR)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(xml2)
+library(readr)
+library(readxl)
+library(writexl)
+library(tidyverse) # includes ggplot2, for data visualisation. dplyr, for data manipulation.
+library(RColorBrewer) # for a colourful plot
+library(ggrepel) # for nice annotations
+
+# Monoisotopic masses of amino acids
+amino_acid_masses <- c(
+  A = 71.03711, R = 156.10111, N = 114.04293, D = 115.02694,
+  C = 103.00919, E = 129.04259, Q = 128.05858, G = 57.02146,
+  H = 137.05891, I = 113.08406, L = 113.08406, K = 128.09496,
+  M = 131.04049, F = 147.06841, P = 97.05276, S = 87.03203,
+  T = 101.04768, W = 186.07931, Y = 163.06333, V = 99.06841
+)
+
+# Atomic masses for elements (Monoisotopic)
+atomic_masses <- c(
+  C = 12.0, c = 13.0033548378, H = 1.007825, h = 1.007276, N = 14.003074, n = 15.0001088982, O = 15.994915, P = 30.973762, S = 31.972071
+)
+
+# Adjustments for ion types - revised from disambiguator because Byonic accounts for TMT mass differently
+ion_type_adjustments <- list(
+  a = -(atomic_masses["C"] + atomic_masses["O"] + atomic_masses["H"]),
+  b = 0, # [N]+[M]-H  ; N = mass of neutral N terminal group
+  y = atomic_masses["H"] * (2) + atomic_masses["O"], # Neutral mass = [C]+[M]+H ; C = mass of neutral C-terminal group (OH)
+  c = atomic_masses["H"] + (atomic_masses["H"] * (2) + atomic_masses["N"]), # [N]+[M]+NH2  ; N = mass of neutral N terminal group
+  z = atomic_masses["O"] - atomic_masses["N"], # Neutral mass = [C]+[M]-NH2 ; C = mass of neutral C-terminal group (OH)
+	# We're really printing Z-dot ions so we add an H to make it OH+[M]-NH2 +H = [M]+O-N
+  Ion_AmmoniaLossMass = atomic_masses["H"] * 3 + atomic_masses["N"], # Define neutral loss masses
+  Ion_WaterLossMass = atomic_masses["H"] * 2 + atomic_masses["O"] # Define neutral loss masses
+)
+
+# Define fn to calculate tolerance
+calculate_tolerance <- function(mz, ppm) {
+  return(as.numeric(mz) * ppm / 1e6)
+}
+
+# Function to calculate m/z for ions
+calculate_ion_mz <- function(peptide_mass, charge) {
+  # Adjust mass for ion type and add protons for charge
+  mz <- (peptide_mass + atomic_masses["h"] * charge) / charge # h is proton
+  return(mz)
+}
+
+calculate_fragment_mass_from_sequence <- function(sequence, modifications = NULL) {
+  mass <- sum(sapply(strsplit(sequence, "")[[1]], function(aa) {
+    if (aa %in% names(amino_acid_masses)) {
+      return(amino_acid_masses[[aa]])
+    } else {
+      stop(paste("Undefined amino acid or modification:", aa))
+    }
+  }))
+  
+  proton_mass_subtracted <- 0
+  if (!is.null(modifications) && nrow(modifications) > 0) {
+    for (i in 1:nrow(modifications)) {
+      mod <- modifications[i, ]
+      if (mod$position <= nchar(sequence)) {
+        mass <- mass + as.numeric(mod$variable)  # Add modification mass
+        # Check for specific modification mass and subtract a proton's mass if applicable
+        if (abs(mod$variable - 42.046950) < .Machine$double.eps^0.5) {
+          mass <- mass - atomic_masses["h"]  # Subtract proton's mass for each occurrence
+          proton_mass_subtracted <- proton_mass_subtracted + 1
+        }
+      }
+    }
+  }
+  
+  return(mass)
+}
+
+generate_ions_for_sequence <- function(sequence, modifications_df) {
+  ions_list <- list()
+  sequence_length <- nchar(sequence)
+  
+  for (charge in 1:5) { # Revised to +5 charge state max based on Byonic ion depiction
+    a_ions <- numeric(sequence_length - 1)
+    a_nl_O_ions <- numeric(sequence_length - 1)
+    a_nl_N_ions <- numeric(sequence_length - 1)
+    a_nl_Kme3_ions <- numeric(sequence_length - 1) # New vector for Kme3 neutral loss
+    a_nl_pST_ions <- numeric(sequence_length - 1) # New vector for pST neutral loss
+    a_nl_Ksu_ions <- numeric(sequence_length - 1) # New vector for Ksu neutral loss
+    b_ions <- numeric(sequence_length - 1)
+    b_nl_O_ions <- numeric(sequence_length - 1)
+    b_nl_N_ions <- numeric(sequence_length - 1)
+    b_nl_Kme3_ions <- numeric(sequence_length - 1) # New vector for Kme3 neutral loss
+    b_nl_pST_ions <- numeric(sequence_length - 1) # New vector for pST neutral loss
+    b_nl_Ksu_ions <- numeric(sequence_length - 1) # New vector for Ksu neutral losS
+    y_ions <- numeric(sequence_length - 1)
+    y_nl_O_ions <- numeric(sequence_length - 1)
+    y_nl_N_ions <- numeric(sequence_length - 1)
+    y_nl_Kme3_ions <- numeric(sequence_length - 1) # New vector for Kme3 neutral loss
+    y_nl_pST_ions <- numeric(sequence_length - 1) # New vector for pST neutral loss
+    y_nl_Ksu_ions <- numeric(sequence_length - 1) # New vector for Ksu neutral losS
+    c_ions <- numeric(sequence_length - 1)
+    c_nl_O_ions <- numeric(sequence_length - 1)
+    c_nl_N_ions <- numeric(sequence_length - 1)
+    c_nl_Kme3_ions <- numeric(sequence_length - 1) # New vector for Kme3 neutral loss
+    c_nl_pST_ions <- numeric(sequence_length - 1) # New vector for pST neutral loss
+    c_nl_Ksu_ions <- numeric(sequence_length - 1) # New vector for Ksu neutral losS
+    z_ions <- numeric(sequence_length - 1)
+    z_nl_O_ions <- numeric(sequence_length - 1)
+    z_nl_N_ions <- numeric(sequence_length - 1)
+    z_nl_Kme3_ions <- numeric(sequence_length - 1) # New vector for Kme3 neutral loss
+    z_nl_pST_ions <- numeric(sequence_length - 1) # New vector for pST neutral loss
+    z_nl_Ksu_ions <- numeric(sequence_length - 1) # New vector for Ksu neutral losS
+    
+    for (i in 1:(sequence_length - 1)) {
+      a_seq <- substr(sequence, 1, i)
+      b_seq <- substr(sequence, 1, i)
+      y_seq <- substr(sequence, sequence_length - i + 1, sequence_length)
+      c_seq <- substr(sequence, 1, i)
+      z_seq <- substr(sequence, sequence_length - i + 1, sequence_length)
+      
+      # For b ions, use positions directly as they are from N-terminus
+      a_mods <- modifications_df[modifications_df$position <= i,]
+      b_mods <- modifications_df[modifications_df$position <= i,]
+      c_mods <- modifications_df[modifications_df$position <= i,]
+      
+      # For y ions, adjust positions relative to the fragment's C-terminus
+      y_mods <- modifications_df
+      if (nrow(y_mods) > 0) {
+        y_mods$position <- sequence_length - y_mods$position + 1
+        y_mods <- y_mods[y_mods$position <= i,]
+      }
+      z_mods <- modifications_df
+      if (nrow(z_mods) > 0) {
+        z_mods$position <- sequence_length - z_mods$position + 1
+        z_mods <- z_mods[z_mods$position <= i,]
+      }
+
+      # Check for specific modification by mass and calculate neutral loss
+      if (any(abs(a_mods$variable - 42.046950) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Kme3_loss <- 59.073499  # Define this value
+        a_mass_specific_mod_loss <- a_mass - specific_Kme3_loss
+        a_nl_Kme3_ions[i] <- calculate_ion_mz(a_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(b_mods$variable - 42.046950) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Kme3_loss <- 59.073499  # Define this value
+        b_mass_specific_mod_loss <- b_mass - specific_Kme3_loss
+        b_nl_Kme3_ions[i] <- calculate_ion_mz(b_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(y_mods$variable - 42.046950) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Kme3_loss <- 59.073499  # Define this value
+        y_mass_specific_mod_loss <- y_mass - specific_Kme3_loss
+        y_nl_Kme3_ions[i] <- calculate_ion_mz(y_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(c_mods$variable - 42.046950) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Kme3_loss <- 59.073499  # Define this value
+        c_mass_specific_mod_loss <- c_mass - specific_Kme3_loss
+        c_nl_Kme3_ions[i] <- calculate_ion_mz(c_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(z_mods$variable - 42.046950) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Kme3_loss <- 59.073499  # Define this value
+        z_mass_specific_mod_loss <- z_mass - specific_Kme3_loss
+        z_nl_Kme3_ions[i] <- calculate_ion_mz(z_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(a_mods$variable - 79.966331) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_pST_loss <- 97.976896  # Define this value
+        a_mass_specific_mod_loss <- a_mass - specific_pST_loss
+        a_nl_pST_ions[i] <- calculate_ion_mz(a_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(b_mods$variable - 79.966331) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_pST_loss <- 97.976896  # Define this value
+        b_mass_specific_mod_loss <- b_mass - specific_pST_loss
+        b_nl_pST_ions[i] <- calculate_ion_mz(b_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(y_mods$variable - 79.966331) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_pST_loss <- 97.976896  # Define this value
+        y_mass_specific_mod_loss <- y_mass - specific_pST_loss
+        y_nl_pST_ions[i] <- calculate_ion_mz(y_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(c_mods$variable - 79.966331) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_pST_loss <- 97.976896  # Define this value
+        c_mass_specific_mod_loss <- c_mass - specific_pST_loss
+        c_nl_pST_ions[i] <- calculate_ion_mz(c_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(z_mods$variable - 79.966331) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_pST_loss <- 97.976896  # Define this value
+        z_mass_specific_mod_loss <- z_mass - specific_pST_loss
+        z_nl_pST_ions[i] <- calculate_ion_mz(z_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(a_mods$variable - 100.01604) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Ksu_loss <- 101.02387  # Define this value
+        a_mass_specific_mod_loss <- a_mass - specific_Ksu_loss
+        a_nl_Ksu_ions[i] <- calculate_ion_mz(a_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(b_mods$variable - 100.01604) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Ksu_loss <- 101.02387  # Define this value
+        b_mass_specific_mod_loss <- b_mass - specific_Ksu_loss
+        b_nl_Ksu_ions[i] <- calculate_ion_mz(b_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(y_mods$variable - 100.01604) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Ksu_loss <- 101.02387  # Define this value
+        y_mass_specific_mod_loss <- y_mass - specific_Ksu_loss
+        y_nl_Ksu_ions[i] <- calculate_ion_mz(y_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(c_mods$variable - 100.01604) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Ksu_loss <- 101.02387  # Define this value
+        c_mass_specific_mod_loss <- c_mass - specific_Ksu_loss
+        c_nl_Ksu_ions[i] <- calculate_ion_mz(c_mass_specific_mod_loss, charge)
+      }
+      if (any(abs(z_mods$variable - 100.01604) < .Machine$double.eps^0.5)) {
+        # Assuming a specific neutral loss for this modification
+        specific_Ksu_loss <- 101.02387  # Define this value
+        z_mass_specific_mod_loss <- z_mass - specific_Ksu_loss
+        z_nl_Ksu_ions[i] <- calculate_ion_mz(z_mass_specific_mod_loss, charge)
+      }
+      
+      # Calculate the mass of the b and y ion sequences
+      a_mass <- calculate_fragment_mass_from_sequence(a_seq, a_mods) + ion_type_adjustments$a
+      b_mass <- calculate_fragment_mass_from_sequence(b_seq, b_mods) + ion_type_adjustments$b
+      y_mass <- calculate_fragment_mass_from_sequence(y_seq, y_mods) + ion_type_adjustments$y
+      c_mass <- calculate_fragment_mass_from_sequence(c_seq, c_mods) + ion_type_adjustments$c
+      z_mass <- calculate_fragment_mass_from_sequence(z_seq, z_mods) + ion_type_adjustments$z
+      
+      # Check for potential neutral losses and calculate accordingly
+      if (grepl("[KRQN]", a_seq)) {
+        a_mass_N_loss <- a_mass - ion_type_adjustments$Ion_AmmoniaLossMass
+        a_nl_N_ions[i] <- calculate_ion_mz(a_mass_N_loss, charge)
+      }
+      if (grepl("[STED]", a_seq)) {
+        a_mass_O_loss <- a_mass - ion_type_adjustments$Ion_WaterLossMass
+        a_nl_O_ions[i] <- calculate_ion_mz(a_mass_O_loss, charge)
+      }
+      if (grepl("[KRQN]", b_seq)) {
+        b_mass_N_loss <- b_mass - ion_type_adjustments$Ion_AmmoniaLossMass
+        b_nl_N_ions[i] <- calculate_ion_mz(b_mass_N_loss, charge)
+      }
+      if (grepl("[STED]", b_seq)) {
+        b_mass_O_loss <- b_mass - ion_type_adjustments$Ion_WaterLossMass
+        b_nl_O_ions[i] <- calculate_ion_mz(b_mass_O_loss, charge)
+      }
+      # Check for potential neutral losses and calculate accordingly
+      if (grepl("[KRQN]", y_seq)) {
+        y_mass_N_loss <- y_mass - ion_type_adjustments$Ion_AmmoniaLossMass
+        y_nl_N_ions[i] <- calculate_ion_mz(y_mass_N_loss, charge)
+      }
+      if (grepl("[STED]", y_seq)) {
+        y_mass_O_loss <- y_mass - ion_type_adjustments$Ion_WaterLossMass
+        y_nl_O_ions[i] <- calculate_ion_mz(y_mass_O_loss, charge)
+      }
+      # Check for potential neutral losses and calculate accordingly
+      if (grepl("[KRQN]", c_seq)) {
+        c_mass_N_loss <- c_mass - ion_type_adjustments$Ion_AmmoniaLossMass
+        c_nl_N_ions[i] <- calculate_ion_mz(c_mass_N_loss, charge)
+      }
+      if (grepl("[STED]", c_seq)) {
+        c_mass_O_loss <- c_mass - ion_type_adjustments$Ion_WaterLossMass
+        c_nl_O_ions[i] <- calculate_ion_mz(c_mass_O_loss, charge)
+      }
+      # Check for potential neutral losses and calculate accordingly
+      if (grepl("[KRQN]", z_seq)) {
+        z_mass_N_loss <- z_mass - ion_type_adjustments$Ion_AmmoniaLossMass
+        z_nl_N_ions[i] <- calculate_ion_mz(z_mass_N_loss, charge)
+      }
+      if (grepl("[STED]", z_seq)) {
+        z_mass_O_loss <- z_mass - ion_type_adjustments$Ion_WaterLossMass
+        z_nl_O_ions[i] <- calculate_ion_mz(z_mass_O_loss, charge)
+      }
+      
+      a_ions[i] <- calculate_ion_mz(a_mass, charge)
+      b_ions[i] <- calculate_ion_mz(b_mass, charge)
+      y_ions[i] <- calculate_ion_mz(y_mass, charge)
+      c_ions[i] <- calculate_ion_mz(c_mass, charge)
+      z_ions[i] <- calculate_ion_mz(z_mass, charge)
+    }
+    
+    ions_list[[paste("a_ions_charge", charge)]] <- a_ions
+    ions_list[[paste("a_nl_O_ions_charge", charge)]] <- a_nl_O_ions
+    ions_list[[paste("a_nl_N_ions_charge", charge)]] <- a_nl_N_ions
+    ions_list[[paste("a_nl_Kme3_ions_charge", charge)]] <- a_nl_Kme3_ions
+    ions_list[[paste("a_nl_pST_ions_charge", charge)]] <- a_nl_pST_ions
+    ions_list[[paste("a_nl_Ksu_ions_charge", charge)]] <- a_nl_Ksu_ions
+    ions_list[[paste("b_ions_charge", charge)]] <- b_ions
+    ions_list[[paste("b_nl_O_ions_charge", charge)]] <- b_nl_O_ions
+    ions_list[[paste("b_nl_N_ions_charge", charge)]] <- b_nl_N_ions
+    ions_list[[paste("b_nl_Kme3_ions_charge", charge)]] <- b_nl_Kme3_ions
+    ions_list[[paste("b_nl_pST_ions_charge", charge)]] <- b_nl_pST_ions
+    ions_list[[paste("b_nl_Ksu_ions_charge", charge)]] <- b_nl_Ksu_ions
+    ions_list[[paste("y_ions_charge", charge)]] <- y_ions
+    ions_list[[paste("y_nl_O_ions_charge", charge)]] <- y_nl_O_ions
+    ions_list[[paste("y_nl_N_ions_charge", charge)]] <- y_nl_N_ions
+    ions_list[[paste("y_nl_Kme3_ions_charge", charge)]] <- y_nl_Kme3_ions
+    ions_list[[paste("y_nl_pST_ions_charge", charge)]] <- y_nl_pST_ions
+    ions_list[[paste("y_nl_Ksu_ions_charge", charge)]] <- y_nl_Ksu_ions
+    ions_list[[paste("c_ions_charge", charge)]] <- c_ions
+    ions_list[[paste("c_nl_O_ions_charge", charge)]] <- c_nl_O_ions
+    ions_list[[paste("c_nl_N_ions_charge", charge)]] <- c_nl_N_ions
+    ions_list[[paste("c_nl_Kme3_ions_charge", charge)]] <- c_nl_Kme3_ions
+    ions_list[[paste("c_nl_pST_ions_charge", charge)]] <- c_nl_pST_ions
+    ions_list[[paste("c_nl_Ksu_ions_charge", charge)]] <- c_nl_Ksu_ions
+    ions_list[[paste("z_ions_charge", charge)]] <- z_ions
+    ions_list[[paste("z_nl_O_ions_charge", charge)]] <- z_nl_O_ions
+    ions_list[[paste("z_nl_N_ions_charge", charge)]] <- z_nl_N_ions
+    ions_list[[paste("z_nl_Kme3_ions_charge", charge)]] <- z_nl_Kme3_ions
+    ions_list[[paste("z_nl_pST_ions_charge", charge)]] <- z_nl_pST_ions
+    ions_list[[paste("z_nl_Ksu_ions_charge", charge)]] <- z_nl_Ksu_ions
+  }
+  
+  return(ions_list)
+}
+
+# Matching function
+find_matches_with_intensity <- function(ions_df, scan_data, ppm_tolerance, sequence) {
+  matches <- list()
+  sequence_length <- nchar(sequence)
+  max_intensity <- max(scan_data[, "intensity"], na.rm = TRUE)
+  
+  # Identify ion type columns in the dataframe
+  ion_columns <- names(ions_df)
+  
+  for (ion_column in ion_columns) {
+    # Determine the charge state based on the column name
+    charge_state <- as.numeric(gsub(".*charge[ .](\\d+)$", "\\1", ion_column))
+    ion_vector <- ions_df[[ion_column]]
+    
+    for (i in seq_along(ion_vector)) {
+      ion_mass <- ion_vector[i]
+
+      # Early skip conditions based on charge state and position in sequence
+      if ((charge_state == 1 && i > (sequence_length / 4)) ||
+          (charge_state == 2 && i > (sequence_length / 3)) ||
+          (charge_state == 3 && i > (sequence_length / 3)) ||
+          (charge_state == 4 && i < 4) ||
+          (charge_state == 5 && i < (sequence_length / 3)) ||
+          (charge_state == 6 && i < (sequence_length / 2))) {
+        next
+      }
+      
+      ion_tolerance <- calculate_tolerance(ion_mass, ppm_tolerance)
+      
+      # Find all potential matching indices
+      all_matching_indices <- which(abs(scan_data[, "mz"] - ion_mass) <= ion_tolerance)
+
+      if (length(all_matching_indices) > 0) {
+        # Calculate distances for all matches
+        distances <- abs(scan_data[all_matching_indices, "mz"] - ion_mass)
+        # Select the index with the smallest distance
+        closest_match_index <- all_matching_indices[which.min(distances)]
+
+        # Calculate expected isotopic m/z and its tolerance
+        expected_isotopic_mz <- scan_data[closest_match_index, "mz"] + (1 / charge_state)
+        isotopic_tolerance <- calculate_tolerance(expected_isotopic_mz, ppm_tolerance)
+        isotopic_peak_indices <- which(abs(scan_data[, "mz"] - expected_isotopic_mz) <= isotopic_tolerance)
+
+        if (length(isotopic_peak_indices) > 0) {
+          distances <- abs(scan_data[isotopic_peak_indices, "mz"] - expected_isotopic_mz)
+          nearest_peak_index <- isotopic_peak_indices[which.min(distances)]
+
+          if (scan_data[nearest_peak_index, "intensity"] <= scan_data[closest_match_index, "intensity"]) {
+            # Construct a key for this match, including the column name and ion position
+            match_key <- paste(ion_column,
+                               "pos",
+                               i,
+                               "mz",
+                               round(ion_mass, 4),
+                               "charge",
+                               charge_state,
+                               sep = "_")
+          # Store match with its intensity
+            matches[[match_key]] <- list(mz = scan_data[closest_match_index, "mz"],
+                                         intensity = scan_data[closest_match_index, "intensity"]
+                                         )
+          }
+        }
+      }
+    }
+  }
+
+  return(matches)
+}
+
+# Key Points:
+# Charge State Detection: The function now includes logic to determine the charge state from the column name. This uses a regular expression with gsub() to extract the charge state number from the column name pattern like "y_ions_charge.1". Adjust the pattern as necessary to match your dataframe's column naming convention.
+
+# Biochemical Rule Application: Before proceeding with the match finding for each ion, it checks if the ion is in the +1 charge state and if its position is greater than half the length of the sequence. If both conditions are met, the next statement skips the rest of the current iteration, effectively filtering out these ions from the match list.
+
+# Sequence Length Consideration: The function now requires the sequence parameter to calculate the sequence length and thereby apply the biochemical rule accurately.
+
+# This approach allows you to integrate specific biochemical rules into the process of identifying and retaining meaningful matches, enhancing the biological relevance of your analysis results.
+
+stored_parameters <- list(
+  max_mods = max_mods,
+  PEP.2D = PEP,
+#  FDR.2D = FDR,
+  min_delta_mod = min_delta_mod,
+  ppm_tolerance = ppm_tolerance,
+  aa_tag = aa_tag
+#  min_int_threshold = min_int_threshold,
+#  unambiguous = unambiguous
+)
+
+save_name <- function(stored_parameters) {
+  # Generate a file name based on the parameters
+  file_name <- paste0(
+    "Byonic_",
+    "max_mods_", stored_parameters$max_mods, "_",
+    "PEP.2D_", stored_parameters$PEP, "_",
+#    "FDR.2D_", stored_parameters$FDR, "_",
+    "min_delta_mod_", stored_parameters$min_delta_mod, "_",
+    "ppm_tolerance_", stored_parameters$ppm_tolerance, "_",
+    stored_parameters$aa_tag, "-tag"
+#    "min_int_threshold_", stored_parameters$min_int_threshold, "_",
+#    "unambiguous_", stored_parameters$unambiguous
+  )
+  return(file_name)
+}
+
+save_name_suffix <- save_name(stored_parameters)
+save_name_RData_suffix <- paste0(save_name(stored_parameters), ".RData")
+save_name_csv_suffix <- paste0(save_name(stored_parameters), ".csv")
+```
+
+Read in Byonic data
+
+```{r}
+setwd(directory)
+
+# Export Byonic search results as a csv
+# Read in Byonic search results from csv
+Byonic_df <- read.csv("Byonic_results.csv")
+
+Byonic_df_backup <- Byonic_df
+Byonic_df <- Byonic_df_backup
+
+Byonic_df <- Byonic_df %>%
+#  mutate(FDR.2D = as.numeric(FDR.2D)) %>%
+#  filter(FDR.2D <= FDR) %>%
+  mutate(PEP.2D = as.numeric(PEP.2D),
+         Delta.Mod..Score = as.numeric(Delta.Mod..Score),
+         Obs..Frag..Sum = as.integer(Obs..Frag..Sum),
+         Scan.Number.s...Posit. = as.integer(Scan.Number.s...Posit.)) %>%
+  filter(PEP.2D <= PEP) %>%
+  filter(Delta.Mod..Score >= min_delta_mod) #%>%
+#  extract(col = Scan.., into = "scan_number", regex = "scan=(\\d+)", remove = FALSE) %>%
+#  mutate(scan_number = as.integer(scan_number))
+
+print(unique(Byonic_df$Sequence..unformatted.))
+
+Byonic_df <- Byonic_df %>%
+  filter(!(str_detect(Scan.Time.s...Posit., ";"))) %>%
+  filter(
+    str_detect(Sequence..unformatted., "ARTKQTARKSTGGKAPRKQLATKAARKSAPATGGGH") |
+    str_detect(Sequence..unformatted., "ARTKQTARKSTGGKAPRKQLATKAARKSAPSTGGGH")
+  ) %>%
+  select("Row.", "PID", "Protein.name", "Sequence..unformatted.", "Sequence", "Score", "Delta.Score", "Delta.Mod..Score", "XIC.area.summed", "XIC.AUC", "XIC.Start", "XIC.End", "Obs..Frag..Sum", "Scan.Number.s...Posit.", "Mod..AAs", "Mod..Names", "Mod..Summary", "Var..Pos..Protein", "PEP.2D", "PEP.1D", "Delta.Mod..Score", "Row.type", "Score.Rank", "MS2.Search.Alias.name", "Byonic.Comment", "Protein.alias.name", "Fixed.Mod..Summary", "MS.MS.Query", "MS.Alias.name") %>%
+  mutate(PID = as.integer(PID))
+
+# Combine Mod..Summary and Fixed.Mod..Summary into a new column 'modifications'
+Byonic_df <- Byonic_df %>%
+  mutate(modifications = case_when(
+    Mod..Summary == "" & Fixed.Mod..Summary == "" ~ "",
+    Mod..Summary == "" ~ Fixed.Mod..Summary,
+    Fixed.Mod..Summary == "" ~ Mod..Summary,
+    TRUE ~ paste(Mod..Summary, Fixed.Mod..Summary, sep = "; ")
+  )) %>%
+  mutate(modifications = str_replace_all(modifications, "Sortag2", "37"))
+
+# Define a function to parse position and mass values and create a dataframe
+parse_position_mass <- function(mod_str) {
+  mod_list <- str_split(mod_str, ";\\s*")[[1]]
+  mods_df <- map_df(mod_list, ~ {
+    if (.x != "") {
+      # Extract only the numeric part of the position
+      position <- as.integer(str_extract(.x, "\\d+"))
+      variable <- as.numeric(str_extract(.x, "(?<=/)[\\d\\.]+"))
+      tibble(position = position, variable = variable)
+    } else {
+      tibble(position = NA_integer_, variable = NA_real_)
+    }
+  })
+  
+  # Check if both positions 36 and 37 exist in the dataframe
+  if(all(c(36, 37) %in% mods_df$position)) {
+    # Calculate the sum of the masses for positions 36 and 37
+    sum_mass <- sum(mods_df$variable[mods_df$position %in% c(36, 37)], na.rm = TRUE)
+    
+    # Remove the original rows for position 37
+    mods_df <- mods_df[!mods_df$position %in% c(37), ]
+    
+    # Update the mass at position 36 to the new sum
+    if(any(mods_df$position == 36)) {
+      mods_df <- mods_df %>%
+        mutate(variable = if_else(position == 36, sum_mass, variable))
+      # Change the position of this updated mass from 36 to 37
+      mods_df <- mods_df %>%
+        mutate(position = if_else(position == 36, 36, position))
+    } else {
+      # If position 36 doesn't exist, just add a new row for position 37
+      mods_df <- bind_rows(mods_df, tibble(position = 36, variable = sum_mass))
+    }
+  }
+  
+  return(mods_df)
+}
+
+Byonic_df <- Byonic_df %>%
+  rowwise() %>%
+  mutate(modifications_df = list(parse_position_mass(modifications))) %>%
+  ungroup()
+
+# If multiple experiments were analyzed together in Byonic, filter them for individual analysis here
+# Filtering by experiment name
+experiment1_df <- Byonic_df %>% filter(MS.Alias.name %in% c("your_ms_experiment_1"))
+
+# Filtering by experiment name
+experiment2_df <- Byonic_df %>% filter(MS.Alias.name %in% c("your_ms_experiment_1"))
+
+# Filtering by experiment name
+experiment3_df <- Byonic_df %>% filter(MS.Alias.name %in% c("your_ms_experiment_1"))                
+
+# Generic list function
+#Byonic_list <- by(Byonic_df, 1:nrow(Byonic_df), function(row) {
+#  list(scan_number = row$Scan.Number.s...Posit.,
+#       sequence = row$Sequence..unformatted.,
+#       PID = row$PID,
+#       modifications_df = row$modifications_df)  # Assuming 'mz' is correctly structured for all workers
+#})
+
+experiment1_list <- by(experiment1_df, 1:nrow(experiment1_df), function(row) {
+  list(scan_number = row$Scan.Number.s...Posit.,
+       sequence = row$Sequence..unformatted.,
+       PID = row$PID,
+       modifications_df = row$modifications_df)  # Assuming 'mz' is correctly structured for all workers
+})
+
+experiment2_list <- by(experiment2_df, 1:nrow(experiment2_df), function(row) {
+  list(scan_number = row$Scan.Number.s...Posit.,
+       sequence = row$Sequence..unformatted.,
+       PID = row$PID,
+       modifications_df = row$modifications_df)  # Assuming 'mz' is correctly structured for all workers
+})
+
+experiment3_list <- by(experiment3_df, 1:nrow(experiment3_df), function(row) {
+  list(scan_number = row$Scan.Number.s...Posit.,
+       sequence = row$Sequence..unformatted.,
+       PID = row$PID,
+       modifications_df = row$modifications_df)  # Assuming 'mz' is correctly structured for all workers
+})
+
+experiment1_scan_list <- as.list(c(experiment1_df$Scan.Number.s...Posit.))
+
+experiment2_scan_list <- as.list(c(experiment2_df$Scan.Number.s...Posit.))
+
+experiment3_scan_list <- as.list(c(experiment3_df$Scan.Number.s...Posit.))
+
+# Create list of mz intensity values
+process_list <- function(input_list) {
+  # Initialize list to store values
+  empty_list <- list()
+
+  # Iterate through Scan_list using retrieved scan_number values
+  for(i in seq_along(input_list)) {
+    scan_number <- as.character(input_list[[i]]$scan_number)
+    PID <- as.character(input_list[[i]]$PID)
+    scan_data <- input_list[[i]]
+    empty_list[[as.character(scan_number)]][[PID]] <- scan_data
+  }
+  
+  # Explicitly return the list
+  return(empty_list)
+}
+
+experiment1_list <- process_list(experiment1_list)
+
+experiment2_list <- process_list(experiment2_list)
+
+experiment3_list <- process_list(experiment3_list)
+
+```
+
+Read in mass spec data
+
+```{r}
+setwd(directory)
+
+# Function to process scans from thermo .RAW data converted to mzML.gz
+# Create list of mz intensity values
+process_scans <- function(Scan_list, mz) {
+  # Initialize list to store values
+  mz_list <- list()
+
+  # Iterate through Scan_list using retrieved scan_number values
+  for(i in seq_along(Scan_list)) {
+    scan_number <- as.integer(Scan_list[[i]])
+    scan_data <- as.data.frame(peaks(mz, scan = scan_number))
+    mz_list[[as.character(scan_number)]] <- scan_data
+  }
+  
+  # Explicitly return the list
+  return(mz_list)
+}
+
+experiment1_mz <- openMSfile("C:/path_to_your_data/file1.mzML.gz")
+
+experiment1_mz_list <- process_scans(experiment1_scan_list, experiment1_mz)
+
+experiment2_mz <- openMSfile("C:/path_to_your_data/file2.mzML.gz")
+
+experiment2_mz_list <- process_scans(experiment2_scan_list, experiment2_mz)
+
+experiment3_mz <- openMSfile("C:/path_to_your_data/file3.mzML.gz")
+
+experiment3_mz_list <- process_scans(experiment3_scan_list, experiment3_mz)
+```
+
+Find ion matches
+
+```{r}
+# Function to find ions in the raw data that match the PSM called by Byonic
+list_match <- function(list1_chunk, list2) {
+  matches_data <- list()  # Initialize outside the loops
+  
+  # Iterate through the chunk of list1 using names for direct access
+  for (scan_number in names(list1_chunk)) {
+    # Direct access to each scan_number's data in list1
+    scan_data_list <- list1_chunk[[scan_number]]
+    
+    # Iterate through hits within each scan_number
+    for (PID in names(scan_data_list)) {
+      hit_data <- scan_data_list[[PID]]
+      sequence <- hit_data[["sequence"]]
+      modifications_df <- as.data.frame(hit_data[["modifications_df"]])  
+  
+      # Retrieve m/z and intensity data from list2 using scan_number
+      scan_data <- list2[[scan_number]]
+      
+      # Generate ions for the sequence with its modifications
+      ions_df <- generate_ions_for_sequence(sequence, modifications_df)
+      
+      # Find matching ions in the mass spectrometry data
+      matches_df <- find_matches_with_intensity(ions_df, scan_data, ppm_tolerance, sequence)
+    
+      # Enrich matches_df with additional data
+      matches_df$peptide_sequence <- sequence
+      modifications_str <- apply(modifications_df, 1, function(x) paste(x['position'], x['variable'], sep=":"))
+      matches_df$modifications <- paste(modifications_str, collapse="; ")
+      
+      # Store the match data indexed by scan_number and PID
+      if (!exists(scan_number, matches_data)) {
+        matches_data[[scan_number]] <- list()
+      }
+      matches_data[[scan_number]][[PID]] <- matches_df
+    }
+  }
+  
+  return(matches_data)
+}
+
+Byonic_list <- experiment1_list
+mz_list <- experiment1_mz_list
+
+# 1. Prepare List Chunks
+numCores <- detectCores() / 2  # Save some cores for system tasks
+chunks <- split(Byonic_list, cut(seq_along(Byonic_list), breaks = numCores, labels = FALSE))
+
+# 2. Execute in Parallel
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# 3. Export necessary objects and functions to each cluster node
+clusterExport(cl, varlist = c("find_matches_with_intensity", 
+								              "generate_ions_for_sequence",
+              								"calculate_tolerance",
+              								"calculate_ion_mz",
+              								"calculate_fragment_mass_from_sequence",
+								              "ppm_tolerance",
+								              "amino_acid_masses",
+								              "atomic_masses",
+								              "ion_type_adjustments",
+								              "mz_list",
+								              "list_match"))
+clusterEvalQ(cl, {
+  library(dplyr)  
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Execute the matching function in parallel
+match_results_chunks <- parLapply(cl, chunks, function(chunk) {
+  list_match(chunk, mz_list)
+})
+
+# Combine the lists from each chunk into a single list of matches
+matches_list <- do.call(c, match_results_chunks)
+
+stopCluster(cl)
+
+# Correctly extracting the scan_number values assuming they are the part after the dot
+corrected_names <- sapply(names(matches_list), function(x) {
+    # Splitting the name based on the dot
+    parts <- strsplit(x, "\\.")[[1]]
+    
+    # If there's a part after the dot, return it, otherwise return the original part
+    if (length(parts) > 1) {
+        return(parts[2])  # Return the part after the dot
+    } else {
+        return(x)  # If there's no dot, return the original name
+    }
+})
+
+# Assign the corrected names back to the list
+names(matches_list) <- corrected_names
+```
+
+Convert list to dataframe
+
+```{r}
+# 1. Prepare Data Chunks
+numCores <- detectCores() / 2  # Save some cores for system tasks
+chunks <- split(matches_list, cut(seq_along(matches_list), breaks = numCores, labels = FALSE))
+
+total_chunk_length <- sum(sapply(chunks, length))
+original_length <- length(matches_list)
+if (total_chunk_length != original_length) {
+  stop("Chunk lengths do not sum to the original length.")
+}
+
+# 2. Define a Function for Processing Chunks
+process_chunk <- function(chunk) {
+  # Initialize an empty dataframe for this chunk
+  matches_list_df_chunk <- data.frame(
+    scan_number = integer(),
+    PID = integer(),
+    ion_type = character(),
+    ion_position = integer(),
+    ion_charge = integer(),
+    mz = numeric(),
+    intensity = numeric(),
+    peptide = character(),
+    modifications = character(),
+    stringsAsFactors = FALSE
+  )
+
+  # Initialize an empty list to collect rows for this chunk
+  rows_to_add <- list()
+  
+  # Loop through each scan_number in the chunk
+  for (scan_number in names(chunk)) {
+    for (PID in names(chunk[[scan_number]])) {
+      hit_data <- chunk[[scan_number]][[PID]]
+      
+      # Extract peptide_sequence and modifications for this scan_number and PID
+      peptide_sequence <- hit_data[["peptide_sequence"]]
+      modifications <- hit_data[["modifications"]]
+    
+      # Ensure ion_keys exclude metadata keys
+      ion_keys = setdiff(names(hit_data), c("peptide_sequence", "modifications"))
+  
+      for (ion_key in ion_keys) { # ion_keys defined by setdiff() excluding metadata keys
+        ion_data <- hit_data[[ion_key]]
+  
+       # Extract ion_type and ion_position from ion_key
+        ion_type <- sub("^(.*?)_ions.*$", "\\1", ion_key) # This might need adjustment
+        parts <- strsplit(ion_key, "_pos_")[[1]]
+        ion_position <- as.integer(strsplit(parts[2], "_")[[1]][1])
+  
+        # Extract ion_charge from ion_key
+        charge_pattern <- "_charge[ .]?([0-9]+)_"
+        if(length(gregexpr(charge_pattern, ion_key)[[1]]) > 0) { # Ensure a match is found
+          matches <- regmatches(ion_key, gregexpr(charge_pattern, ion_key))
+          ion_charge <- as.integer(sub(charge_pattern, "\\1", matches[[1]]))
+        } else {
+          ion_charge <- NA # Assign NA if no charge information is extracted
+        }
+      
+        # Collect the new row to add it to the list
+        rows_to_add[[length(rows_to_add) + 1]] <- data.frame(
+          scan_number = as.integer(scan_number),
+          PID = as.integer(PID),
+          ion_type = ion_type,
+          ion_position = ion_position,
+          ion_charge = ion_charge,
+          mz = ion_data$mz,
+          intensity = ion_data$intensity,
+          peptide = peptide_sequence,
+          modifications = modifications,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  
+  # After collecting all rows, combine them into a single dataframe
+  matches_list_df_chunk <- do.call(rbind, rows_to_add)
+}
+
+# 3. Execute in Parallel
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Assuming 'process_chunk' and necessary libraries are already exported to the cluster
+match_results_df_chunks <- parLapply(cl, chunks, process_chunk)
+
+# Combine the dataframes from each chunk
+matches_data_df <- do.call(rbind, match_results_df_chunks)
+
+matches_data_scans <- c(matches_data_df$scan_number)
+Byonic_scans <- c(as.integer(names(Byonic_list)))
+
+# Example for a single missing scan_number
+missing_scan_numbers <- setdiff(Byonic_scans, matches_data_scans)
+for(scan_number in missing_scan_numbers) {
+  if(!is.null(Byonic_list[[as.character(scan_number)]])) {
+    cat("Found in Byonic_list: ", scan_number, "\n")
+  }
+  # Additional checks can be applied similarly for intermediate or processing stages
+}
+
+#Omissions appear to be PSMs with no matched ions under the current criteria
+```
+
+Step-wise disambiguation
+Step 1: split up modifications data
+
+```{r}
+# Assuming matches_data_df_w_mods already exists and has a 'modifications' column
+
+# Define fill_modifications_direct function to work directly on the dataframe
+fill_modifications_direct <- function(df, max_mods) {
+  for (row in 1:nrow(df)) {
+    modification_str <- df$modifications[row]
+    if (is.na(modification_str)) next # Skip if NA
+    
+    mod_parts <- strsplit(modification_str, ";")[[1]]
+    mods <- lapply(mod_parts, function(x) strsplit(x, ":")[[1]])
+    
+    for (i in 1:length(mods)) {
+      if (i > max_mods) break # Do not exceed the max number of modifications
+      mod_pair <- mods[[i]]
+      df[row, paste0("mod_pos_", i)] <- as.numeric(mod_pair[1])
+      df[row, paste0("mod_mass_", i)] <- as.numeric(mod_pair[2])
+    }
+  }
+  return(df)
+}
+
+# Parallelization
+
+# Step 1: Group your dataframe by scan_number
+grouped_df_list <- matches_data_df %>% 
+  group_by(scan_number) %>%
+  group_split()
+
+# Step 2: Prepare to use parallel processing
+numCores <- detectCores() / 2  # Reserve two cores for system tasks
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Step 3: Export necessary objects and functions to each cluster node
+clusterExport(cl, varlist = c("fill_modifications_direct", "max_mods"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Execute the task in parallel
+fill_mods_results <- parLapply(cl, grouped_df_list, function(group) {
+  fill_modifications_direct(group, max_mods)
+})
+
+# Combine the results from all cores
+# The method to combine results depends on the structure of your output
+matches_data_df_w_mods <- bind_rows(fill_mods_results)
+
+add_column_if_not_exists <- function(df, column_name) {
+  # Check if the column does not exist
+  if (!column_name %in% names(df)) {
+    # Create the column with NA values
+    df[[column_name]] <- NA
+  }
+  # Return the modified dataframe
+  return(df)
+}
+
+matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_pos_6") 
+matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_mass_6")
+matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_pos_7") 
+matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_mass_7")
+
+```
+
+Step-wise disambiguation
+Step 2: find nearest_before and nearest_after by modification type
+
+```{r}
+# HELPER functions
+
+# Modified find_nearest_KR function to operate on dataframe columns
+find_nearest_KR_df <- function(peptide, mod_position) {
+  # Initialize vectors to store results
+  nearest_before <- numeric(length(peptide))
+  nearest_after <- numeric(length(peptide))
+  
+  for (i in seq_along(peptide)) {
+    aa_sequence <- unlist(strsplit(peptide[i], ""))
+    kr_positions <- which(aa_sequence %in% c("K", "R"))
+    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
+    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
+  }
+  
+  # Return a dataframe with the calculated positions
+  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
+}
+
+# Modified find_nearest_K function to operate on dataframe columns
+find_nearest_K_df <- function(peptide, mod_position) {
+  # Initialize vectors to store results
+  nearest_before <- numeric(length(peptide))
+  nearest_after <- numeric(length(peptide))
+  
+  for (i in seq_along(peptide)) {
+    aa_sequence <- unlist(strsplit(peptide[i], ""))
+    kr_positions <- which(aa_sequence %in% c("K"))
+    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
+    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
+  }
+  
+  # Return a dataframe with the calculated positions
+  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
+}
+
+# Modified find_nearest_ST function to operate on dataframe columns
+find_nearest_ST_df <- function(peptide, mod_position) {
+  # Initialize vectors to store results
+  nearest_before <- numeric(length(peptide))
+  nearest_after <- numeric(length(peptide))
+  
+  for (i in seq_along(peptide)) {
+    aa_sequence <- unlist(strsplit(peptide[i], ""))
+    kr_positions <- which(aa_sequence %in% c("S", "T"))
+    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
+    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
+  }
+  
+  # Return a dataframe with the calculated positions
+  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
+}
+
+# Assuming max_mods is already defined as the maximum number of modifications you expect per peptide
+# For each modification, you want to add nearest_before_mod_n, nearest_after_mod_n, and nearest_fn
+
+# Add empty columns for nearest_before_mod_n, nearest_after_mod_n, and nearest_fn for each modification
+for(i in 1:max_mods) {
+  matches_data_df_w_mods[paste0("nearest_before_mod_", i)] <- NA_real_
+  matches_data_df_w_mods[paste0("nearest_after_mod_", i)] <- NA_real_
+  matches_data_df_w_mods[paste0("nearest_fn_mod_", i)] <- NA_character_
+}
+
+# Assuming you have a dataframe `matches_data_df_w_mods` with peptides, modification positions, and masses
+
+# Update the function to directly modify the dataframe
+apply_nearest_function_directly <- function(df) {
+  # Iterate over each row of the dataframe
+  for (i in 1:nrow(df)) {
+    # Extract current row's peptide, mod positions, and mod masses
+    peptide <- df$peptide[i]
+    mod_positions <- sapply(1:max_mods, function(n) df[[paste0("mod_pos_", n)]][i])
+    mod_masses <- sapply(1:max_mods, function(n) df[[paste0("mod_mass_", n)]][i])
+
+    # Initialize containers for the results
+    nearest_befores <- rep(NA, max_mods)
+    nearest_afters <- rep(NA, max_mods)
+    nearest_fns <- rep(NA, max_mods)
+    
+    # Process each modification
+    for (j in 1:max_mods) {
+      mod_position <- mod_positions[j]
+      mod_mass <- mod_masses[j]
+      # Skip processing if mod_position or mod_mass is NA
+      if (is.na(mod_position) || is.na(mod_mass)) next
+      
+      # Decide which nearest function to use based on mod_mass
+      if (mod_mass %in% c(14.015650, 28.031300)) {
+        result <- find_nearest_KR_df(peptide, mod_position)
+        nearest_fn <- "KR" # updated to remove trimethylation from KR check
+      } else if (mod_mass %in% c(79.966331)) {
+        result <- find_nearest_ST_df(peptide, mod_position)
+        nearest_fn <- "ST"
+      } else if (mod_mass %in% c(42.010565, 42.046950, 56.026215, 72.02113, 86.036779, 100.01604)) {
+        result <- find_nearest_K_df(peptide, mod_position)
+        nearest_fn <- "K" # updated to add trimethylation given specificity for K
+      } else {
+        result <- list(nearest_before = NA, nearest_after = NA)
+        nearest_fn <- "NA"
+      }
+      
+      # Store the results
+      nearest_befores[j] <- result$nearest_before
+      nearest_afters[j] <- result$nearest_after
+      nearest_fns[j] <- nearest_fn
+    }
+
+    # Assign the results back to the dataframe
+    for (j in 1:max_mods) {
+      df[[paste0("nearest_before_mod_", j)]][i] <- nearest_befores[j]
+      df[[paste0("nearest_after_mod_", j)]][i] <- nearest_afters[j]
+      df[[paste0("nearest_fn_mod_", j)]][i] <- nearest_fns[j]
+    }
+  }
+  
+  return(df)
+}
+
+# Apply the function to your dataframe
+# Parallelization
+
+library(parallel)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Step 1: Group your dataframe by scan_number
+grouped_df_list <- matches_data_df_w_mods %>% 
+  group_by(scan_number) %>%
+  group_split()
+
+# Step 2: Prepare to use parallel processing
+numCores <- detectCores() / 2  # Reserve two cores for system tasks
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Step 3: Export necessary objects and functions to each cluster node
+clusterExport(cl, varlist = c("find_nearest_KR_df", "find_nearest_K_df", "find_nearest_ST_df", "max_mods", "apply_nearest_function_directly"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Execute the task in parallel
+find_nearest_results <- parLapply(cl, grouped_df_list, function(group) {
+  apply_nearest_function_directly(group)
+})
+
+# Combine the results from all cores
+# The method to combine results depends on the structure of your output
+matches_data_df_w_mods_updated <- bind_rows(find_nearest_results)
+```
+
+Step-wise disambiguation
+Step 3: use ion identities to determine whether fragments fall between nearest_before and nearest_after
+
+```{r}
+# Helper function
+
+#First, we need a function that assembles a_b_c_ions_df and y_z_ions_df for each scan_number and PID combination from matches_data_df_w_mods_updated. This will involve filtering the dataframe for each ion type and converting y and z ion positions.
+assemble_ions_df <- function(df, target_scan_number, target_PID) {
+  a_b_c_ions_df <- dplyr::filter(df, 
+                               scan_number == as.numeric(target_scan_number), 
+                               PID == as.numeric(target_PID), 
+                               ion_type %in% c("a", "b", "c", "a_nl_O", "b_nl_O", "c_nl_O", "a_nl_N", "b_nl_N", "c_nl_N", "a_nl_Kme3", "b_nl_Kme3", "c_nl_Kme3", "a_nl_pST", "b_nl_pST", "c_nl_pST", "a_nl_Ksu", "b_nl_Ksu", "c_nl_Ksu"))
+    
+  y_z_ions_df <- a_b_c_ions_df <- dplyr::filter(df, 
+                               scan_number == as.numeric(target_scan_number), 
+                               PID == as.numeric(target_PID), 
+                               ion_type %in% c("y", "z", "y_nl_O", "z_nl_O", "y_nl_N", "z_nl_N", "y_nl_Kme3", "z_nl_Kme3", "y_nl_pST", "z_nl_pST", "y_nl_Ksu", "z_nl_Ksu")) %>%
+    mutate(ion_position = nchar(peptide) - ion_position + 1)
+
+  # Debugging print statements
+  print(paste("ABC Ions DF Rows:", nrow(a_b_c_ions_df)))
+  print(paste("YZ IonscDF Rows:", nrow(y_z_ions_df)))
+  
+  return(list(a_b_c_ions_df = a_b_c_ions_df, y_z_ions_df = y_z_ions_df))
+}
+
+# ions_result <- assemble_ions_df(matches_data_df_w_mods_updated, "983", "1")
+
+check_unambiguity_before <- function(nearest_before, mod_position, a_b_c_ions_df, y_z_ions_df) {
+  # If nearest_before is NA, return unambiguous
+  if (is.na(nearest_before)) return(TRUE)
+
+  abc_unambiguous <- any(a_b_c_ions_df$ion_position >= nearest_before & a_b_c_ions_df$ion_position < mod_position)
+  yz_unambiguous <- any(y_z_ions_df$ion_position > nearest_before & y_z_ions_df$ion_position <= mod_position)
+  return(abc_unambiguous || yz_unambiguous)
+  # TRUE || NA will return TRUE, because if one operand is TRUE, the overall expression is TRUE regardless of the other operand
+  # TRUE || FALSE will return TRUE, because if one operand is TRUE, the overall expression is TRUE regardless of the other operand
+  # NA || TRUE will also return TRUE for the same reason
+  # FALSE || NA will return NA, because the outcome depends on the unknown (NA) operand
+  # NA || FALSE will return NA as well, for the same reason as above
+  # NA || NA will return NA, because there's no sufficient information to determine the result
+}
+
+check_unambiguity_after <- function(nearest_after, mod_position, a_b_c_ions_df, y_z_ions_df) {
+  # If nearest_after is NA, return unambiguous
+  if (is.na(nearest_after)) return(TRUE)
+
+  abc_unambiguous <- any(a_b_c_ions_df$ion_position < nearest_after & a_b_c_ions_df$ion_position >= mod_position)
+  yz_unambiguous <- any(y_z_ions_df$ion_position <= nearest_after & y_z_ions_df$ion_position > mod_position)
+  return(abc_unambiguous || yz_unambiguous)
+}
+
+# Add the required columns for ambiguity checks
+matches_data_df_w_mods_updated <- matches_data_df_w_mods_updated %>%
+  mutate(across(paste0("mod_pos_", 1:max_mods), 
+                list(abc_before_unambiguous = ~NA,
+                     yz_before_unambiguous = ~NA,
+                     abc_after_unambiguous = ~NA,
+                     yz_after_unambiguous = ~NA),
+                .names = "{.col}_{.fn}"))
+
+# Working function to apply ambiguity checks for each modification in a row
+  apply_ambiguity_checks <- function(df, max_mods) {
+  # Iterate through each mod_pos_ column
+  for (i in 1:max_mods) {
+    mod_pos_col <- paste0("mod_pos_", i)
+    nearest_before_col <- paste0("nearest_before_mod_", i)
+    nearest_after_col <- paste0("nearest_after_mod_", i)
+    abc_before_unambiguous_col <- paste0("mod_pos_", i, "_abc_before_unambiguous")
+    yz_before_unambiguous_col <- paste0("mod_pos_", i, "_yz_before_unambiguous")
+    abc_after_unambiguous_col <- paste0("mod_pos_", i, "_abc_after_unambiguous")
+    yz_after_unambiguous_col <- paste0("mod_pos_", i, "_yz_after_unambiguous")
+    
+    # Dynamically creating column names for assignment
+    df <- df %>%
+      rowwise() %>%
+      mutate(
+        !!abc_before_unambiguous_col := if_else(
+          !is.na(.data[[mod_pos_col]]),
+          # Assuming assemble_ions_df and check_unambiguity_before return a single value or NA_real_
+          {
+            ions <- assemble_ions_df(cur_data(), scan_number, PID)
+            check_unambiguity_before(.data[[nearest_before_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
+          },
+          NA_real_
+        ),
+        !!yz_before_unambiguous_col := if_else(
+          !is.na(.data[[mod_pos_col]]),
+          {
+            ions <- assemble_ions_df(cur_data(), scan_number, PID)
+            check_unambiguity_before(.data[[nearest_before_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
+          },
+          NA_real_
+        ),
+        !!abc_after_unambiguous_col := if_else(
+          !is.na(.data[[mod_pos_col]]),
+          {
+            ions <- assemble_ions_df(cur_data(), scan_number, PID)
+            check_unambiguity_after(.data[[nearest_after_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
+          },
+          NA_real_
+        ),
+        !!yz_after_unambiguous_col := if_else(
+          !is.na(.data[[mod_pos_col]]),
+          {
+            ions <- assemble_ions_df(cur_data(), scan_number, PID)
+            check_unambiguity_after(.data[[nearest_after_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
+          },
+          NA_real_
+        )
+      ) %>%
+      ungroup()
+  }
+  return(df)
+}
+
+
+# Make sure to pass the actual number of max_mods you have in your data
+# test_df <- apply_ambiguity_checks(df, max_mods)
+
+# Apply the checks
+# matches_data_df_w_mods_updated <- apply_ambiguity_checks(matches_data_df_w_mods_updated)
+
+# write_excel_csv(matches_data_df_w_mods_updated, "matches_data_df_w_mods_updated_ambiguity_check1")
+
+```
+
+Parallelization
+
+```{r}
+library(parallel)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+detectCores()
+
+# Step 1: Group your dataframe by scan_number
+grouped_df_list <- matches_data_df_w_mods_updated %>% 
+  group_by(scan_number) %>%
+  group_split()
+
+# Step 2: Prepare to use parallel processing
+numCores <- detectCores() / 2  # Reserve two cores for system tasks
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Step 3: Export necessary objects and functions to each cluster node
+clusterExport(cl, varlist = c("apply_ambiguity_checks", "max_mods", "assemble_ions_df", "check_unambiguity_before", "check_unambiguity_after"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Execute the task in parallel
+results <- parLapply(cl, grouped_df_list, function(group) {
+  apply_ambiguity_checks(group, max_mods)
+})
+
+# Combine the results from all cores
+# The method to combine results depends on the structure of your output
+combined_results <- bind_rows(results)
+
+combined_results <- combined_results %>%
+  mutate(ion_type_position_charge = paste(ion_type, ion_position, ion_charge, sep = "_"))
+```
+
+Confirm whether a hit has disambiguating ions between all modification sites
+
+```{r}
+# Simplified check_columns function
+disambiguate <- function(data, col_range_start, col_range_end) {
+  # Assuming data is already filtered for a specific scan_number and PID
+  
+  # Dynamically select the range of columns if col_range_start and col_range_end are column names
+  columns_to_check <- select(data, dplyr::all_of(col_range_start):dplyr::all_of(col_range_end))
+  
+  # Apply the check across the specified columns
+  columns_check_result <- purrr::map_lgl(columns_to_check, function(column) {
+    # Check if the column contains at least one "1"
+    has_one <- any(column == 1, na.rm = TRUE)
+    # If the column has at least one "1", it satisfies the condition
+    if (has_one) {
+      return(TRUE)
+    } else {
+      # If there are no "1"s, check if there's at least one NA (which also satisfies the condition)
+      return(all(is.na(column)))
+    }
+  })
+  
+  # Return TRUE if all columns meet the criteria
+  return(all(columns_check_result))
+}
+
+# Function to iterate over all scan_number and PID combinations and apply check_columns
+disambiguate_all <- function(data, col_range_start, col_range_end) {
+  results <- data %>%
+    group_by(scan_number, PID) %>%
+    summarise(all_true = disambiguate(cur_data(), col_range_start, col_range_end), .groups = 'drop')
+  
+  return(results)
+}
+
+# Step 1: Group your dataframe by scan_number
+grouped_df_list <- combined_results %>% 
+  group_by(scan_number) %>%
+  group_split()
+
+# Step 2: Prepare to use parallel processing
+numCores <- detectCores() / 2  # Reserve two cores for system tasks
+cl <- makeCluster(numCores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Step 3: Export necessary objects and functions to each cluster node
+clusterExport(cl, varlist = c("disambiguate", "disambiguate_all"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Execute the task in parallel
+results <- parLapply(cl, grouped_df_list, function(group) {
+  disambiguate_all(group, 'mod_pos_1_abc_before_unambiguous', 'mod_pos_7_yz_after_unambiguous')
+})
+
+# Combine the results from all cores
+# The method to combine results depends on the structure of your output
+disambiguated_results <- bind_rows(results)
+
+# Assuming df1 is your original dataframe from which to extract peptide information
+peptide_info_df <- combined_results %>%
+  select(scan_number, PID, peptide) %>%
+  distinct()  # Assuming you want unique combinations of scan_number, PID, and peptide
+
+# Assuming df2 is the second dataframe to which you want to add the peptide information
+disambiguated_results <- disambiguated_results %>%
+  left_join(peptide_info_df, by = c("scan_number", "PID"))
+
+disambiguated_true <- disambiguated_results %>%
+  filter(all_true == TRUE)
+
+disambiguated_filenames <- paste0()
+```
+
+Functions for extracting ion information from combined_results
+
+```{r}
+# Function to extract SHARED intensities from a given sublist
+extract_intensities_from_sublist <- function(sublist, ions_list) {
+  # Match ion_type_position with ions_list and extract intensity
+  matched_intensities <- sublist %>%
+    filter(ion_type_position_charge %in% ions_list) %>%
+    pull(intensity)
+  return(matched_intensities)
+}
+
+# Function to find the correct sublist based on scan_number and PID and extract intensities
+extract_intensities <- function(scan_number, PID, ions_list, grouped_list) {
+  # Find the sublist that matches scan_number and PID
+  sublist <- grouped_list %>%
+    purrr::keep(~ all(c(.x$scan_number == scan_number, .x$PID == PID))) %>%
+    # Assuming there is only one match, otherwise you would need to handle multiple matches
+    purrr::pluck(1)
+  
+  # If a matching sublist is found, extract intensities, else return numeric(0)
+  if (!is.null(sublist) && nrow(sublist) > 0) {
+    return(extract_intensities_from_sublist(sublist, ions_list))
+  } else {
+    return(numeric(0))
+  }
+}
+
+# Function to extract shared ions from a given sublist
+extract_ion_identities_from_sublist <- function(sublist, ions_list) {
+  # Match ion_type_position with ions_list and extract intensity
+  matched_identities <- sublist %>%
+    filter(ion_type_position_charge %in% ions_list) %>%
+    pull(ion_type_position_charge)
+  return(matched_identities)
+}
+
+# Function to find the correct sublist based on scan_number and PID and extract intensities
+extract_ordered_ion_lists <- function(scan_number, PID, ions_list, grouped_list) {
+  # Find the sublist that matches scan_number and PID
+  sublist <- grouped_list %>%
+    purrr::keep(~ all(c(.x$scan_number == scan_number, .x$PID == PID))) %>%
+    # Assuming there is only one match, otherwise you would need to handle multiple matches
+    purrr::pluck(1)
+  
+  # If a matching sublist is found, extract intensities, else return numeric(0)
+  if (!is.null(sublist) && nrow(sublist) > 0) {
+    return(extract_ion_identities_from_sublist(sublist, ions_list))
+  } else {
+    return(numeric(0))
+  }
+}
+```
+
+Re-capturing ion lists for disambiguated hits
+
+```{r}
+# Assuming combined_results is your original dataframe from which to extract ion information
+ion_info_df <- combined_results %>%
+  group_by(scan_number, PID) %>%
+  summarise(
+    a_ions = list(unique(unlist(str_extract_all(ion_type_position_charge, "a(_nl_N_|_nl_O_|_nl_Kme3_|_nl_pST_|_nl_Ksu_|_)\\w+")))),
+    b_ions = list(unique(unlist(str_extract_all(ion_type_position_charge, "b(_nl_N_|_nl_O_|_nl_Kme3_|_nl_pST_|_nl_Ksu_|_)\\w+")))),
+    c_ions = list(unique(unlist(str_extract_all(ion_type_position_charge, "c(_nl_N_|_nl_O_|_nl_Kme3_|_nl_pST_|_nl_Ksu_|_)\\w+")))),
+    y_ions = list(unique(unlist(str_extract_all(ion_type_position_charge, "y(_nl_N_|_nl_O_|_nl_Kme3_|_nl_pST_|_nl_Ksu_|_)\\w+")))),
+    z_ions = list(unique(unlist(str_extract_all(ion_type_position_charge, "z(_nl_N_|_nl_O_|_nl_Kme3_|_nl_pST_|_nl_Ksu_|_)\\w+")))),
+    .groups = 'drop'
+  )
+
+# Ensure unique(unlist()) is used to flatten the list from str_extract_all and remove duplicate matches before pasting
+
+PSM_hits <- disambiguated_results %>%
+  left_join(ion_info_df, by = c("scan_number", "PID"))
+
+# set working directory
+setwd(directory)
+
+# Create dataframe of PEP values for merging to PSM_hits
+PEP_df <- Byonic_df %>%
+  select(Scan.Number.s...Posit., PID, PEP.2D)
+
+names(PEP_df)[names(PEP_df) == "Scan.Number.s...Posit."] <- "scan_number"
+
+# Add PEP values to PSM_hits
+PSM_hits <- PSM_hits %>%
+  left_join(PEP_df, by = c("scan_number", "PID"))
+
+# Arrange by scan_number, then posterior_error_prob, and rank_order for tie-breaking
+PSM_hits <- PSM_hits %>%
+  group_by(scan_number) %>%
+  arrange(scan_number, PEP.2D, PID, .by_group = TRUE) %>%
+  ungroup()
+
+# If you want to add a custom rank order based on this arrangement
+PSM_hits <- PSM_hits %>%
+  group_by(scan_number) %>%
+  mutate(rank_order = row_number()) %>%
+  ungroup()
+```
+
+Comparing ion lists
+
+```{r}
+# Create a dataframe with just the relevant ion information
+scan_PID_ion_intensity <- combined_results %>%
+  select("scan_number", "PID", "ion_type_position_charge", "intensity")
+
+# Group by scan_number and PID for later searching
+grouped_ion_intensity_list <- scan_PID_ion_intensity %>% 
+  group_by(scan_number, PID) %>%
+  group_split()
+
+# Identify shared and unique ions for each PID
+PSM_hits <- PSM_hits %>%
+  # Group by scan_number and nest
+  group_by(scan_number) %>%
+  nest() %>%
+  # Calculate shared ions and keep a combined list of all shared ions
+  mutate(
+    shared_ions_details = map(data, ~{
+      a_ions_shared = Reduce(intersect, .x$a_ions)
+      b_ions_shared = Reduce(intersect, .x$b_ions)
+      c_ions_shared = Reduce(intersect, .x$c_ions)
+      y_ions_shared = Reduce(intersect, .x$y_ions)
+      z_ions_shared = Reduce(intersect, .x$z_ions)
+
+      list(
+        a_ions_shared = a_ions_shared,
+        b_ions_shared = b_ions_shared,
+        c_ions_shared = c_ions_shared,
+        y_ions_shared = y_ions_shared,
+        z_ions_shared = z_ions_shared,
+        shared_ions = c(a_ions_shared, b_ions_shared, c_ions_shared, y_ions_shared, z_ions_shared) # Combined list of all shared ions
+      )
+    })
+  ) %>%
+  # Unnest the detailed shared ions for easier manipulation
+  unnest_wider(shared_ions_details) %>%
+  # Ensure we don't drop the nested data yet, as we'll need it for the join
+  select(-data) %>%
+  right_join(PSM_hits, by = "scan_number") %>%
+  # Subtract shared ions to find unique ions for each type
+  mutate(
+    unique_a_ions = map2(a_ions, a_ions_shared, setdiff),
+    unique_b_ions = map2(b_ions, b_ions_shared, setdiff),
+    unique_c_ions = map2(c_ions, c_ions_shared, setdiff),
+    unique_y_ions = map2(y_ions, y_ions_shared, setdiff),
+    unique_z_ions = map2(z_ions, z_ions_shared, setdiff)
+  )
+
+PSM_hits <- PSM_hits %>%
+  rowwise() %>%
+  mutate(
+        # Ensure non-NULL inputs and handle possibility of empty vectors
+    unique_ions = list(c(unique_a_ions, unique_b_ions, unique_c_ions, unique_y_ions, unique_z_ions))
+  ) %>%
+  ungroup()
+
+column_order = c("scan_number", "rank_order", "PEP.2D", "PID", "all_true", "peptide", "a_ions", "b_ions", "c_ions", "y_ions", "z_ions", "a_ions_shared", "b_ions_shared", "c_ions_shared", "y_ions_shared", "z_ions_shared", "shared_ions", "unique_a_ions", "unique_b_ions", "unique_c_ions", "unique_y_ions", "unique_z_ions", "unique_ions")
+PSM_hits <- PSM_hits[, column_order]
+
+# split hits for parallel processing: shared ion intensities
+PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
+  
+  # Initiate cluster
+  no_cores <- detectCores() / 2  # Reserve two cores
+  cl <- makeCluster(no_cores)
+  on.exit(stopCluster(cl), add = TRUE)
+  
+  # Export necessary objects and functions
+  clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+  clusterEvalQ(cl, {
+    library(dplyr)  # Assuming dplyr is used in your functions
+    library(purrr)
+    library(tidyr)
+    library(stringr)
+  })
+  
+  # Process the list of dataframes in parallel
+  processed_chunks <- parLapply(cl, PSM_hits_list, function(df_chunk) {
+    df_chunk %>%
+      rowwise() %>%
+      mutate(matched_intensities = list(extract_intensities(scan_number, PID, shared_ions, grouped_ion_intensity_list))) %>%
+      ungroup()
+  })
+  
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Combine the processed chunks back into a single dataframe
+  PSM_hits <- do.call(rbind, processed_chunks)
+
+# split hits for parallel processing: shared ion intensities
+PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
+  
+  # Initiate cluster
+  no_cores <- detectCores() / 2  # Reserve two cores
+  cl <- makeCluster(no_cores)
+  on.exit(stopCluster(cl), add = TRUE)
+
+  # Export necessary objects and functions
+  clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
+  clusterEvalQ(cl, {
+    library(dplyr)  # Assuming dplyr is used in your functions
+    library(purrr)
+    library(tidyr)
+    library(stringr)
+  })
+  
+  # Process the list of dataframes in parallel
+  processed_chunks <- parLapply(cl, PSM_hits_list, function(df_chunk) {
+    df_chunk %>%
+      rowwise() %>%
+      mutate(ordered_ion_list = list(extract_ordered_ion_lists(scan_number, PID, shared_ions, grouped_ion_intensity_list))) %>%
+      ungroup()
+  })
+
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Combine the processed chunks back into a single dataframe
+  PSM_hits <- do.call(rbind, processed_chunks)
+
+# split hits for parallel processing: shared ion intensities
+PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
+  
+  # Initiate cluster
+  no_cores <- detectCores() / 2  # Reserve two cores
+  cl <- makeCluster(no_cores)
+  on.exit(stopCluster(cl), add = TRUE)
+  
+  # Export necessary objects and functions
+  clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+  clusterEvalQ(cl, {
+    library(dplyr)  # Assuming dplyr is used in your functions
+    library(purrr)
+    library(tidyr)
+    library(stringr)
+  })
+  
+  # Process the list of dataframes in parallel
+  processed_chunks <- parLapply(cl, PSM_hits_list, function(df_chunk) {
+    df_chunk %>%
+      rowwise() %>%
+      mutate(unique_ion_intensities = list(extract_intensities(scan_number, PID, unique_ions, grouped_ion_intensity_list))) %>%
+      ungroup()
+  })
+  
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Combine the processed chunks back into a single dataframe
+  PSM_hits <- do.call(rbind, processed_chunks)
+
+# split hits for parallel processing: shared ion intensities
+PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
+  
+  # Initiate cluster
+  no_cores <- detectCores() / 2  # Reserve two cores
+  cl <- makeCluster(no_cores)
+  on.exit(stopCluster(cl), add = TRUE)
+
+  # Export necessary objects and functions
+  clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
+  clusterEvalQ(cl, {
+    library(dplyr)  # Assuming dplyr is used in your functions
+    library(purrr)
+    library(tidyr)
+    library(stringr)
+  })
+  
+  # Process the list of dataframes in parallel
+  processed_chunks <- parLapply(cl, PSM_hits_list, function(df_chunk) {
+    df_chunk %>%
+      rowwise() %>%
+      mutate(ordered_unique_ion_list = list(extract_ordered_ion_lists(scan_number, PID, unique_ions, grouped_ion_intensity_list))) %>%
+      ungroup()
+  })
+
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Combine the processed chunks back into a single dataframe
+  PSM_hits <- do.call(rbind, processed_chunks)
+```
+
+Dividing PSM_hits by number of hits per scan and coefficient of variation
+
+```{r}
+# Add a column with the first rank_order's intensities for reference
+PSM_hits <- PSM_hits %>%
+  group_by(scan_number) %>%
+  mutate(first_hit_intensities = list(matched_intensities[which.min(rank_order)])) %>%
+  ungroup()
+
+# Calculate ratios
+PSM_hits <- PSM_hits %>%
+  rowwise() %>%
+  mutate(
+    list(
+      intensity_ratios = map2_dbl(
+        matched_intensities, 
+        first(first_hit_intensities), 
+        ~ .x / .y
+      )
+    ) 
+  )  %>%
+  ungroup()
+
+names(PSM_hits)[names(PSM_hits) == "list(...)"] <- "ratio"
+
+# Step 2: Group by scan_number and rank_order, combine ratio values, and compute the average
+PSM_hits <- PSM_hits %>%
+  group_by(scan_number, rank_order) %>%
+  mutate(
+    combined_ratios = list(ratio),  # Combine ratios into a list
+    average_ratio = mean(unlist(combined_ratios)[unlist(combined_ratios) != 1])  # Compute average of non-one values
+  ) %>%
+  ungroup()
+
+# find coefficient of variance in average ratio
+PSM_hits <- PSM_hits %>%
+  group_by(scan_number, rank_order) %>%
+  mutate(
+    coefficient_of_variance = (sd(unlist(combined_ratios)[unlist(combined_ratios) != 1])/mean(unlist(combined_ratios)[unlist(combined_ratios) != 1]))  # Compute coefficient of variance of non-one values
+  ) %>%
+  ungroup()
+
+file_name <- paste0("PSM_hits_", save_name_RData_suffix)
+save(PSM_hits, file = file_name)
+
+# subseting spectra based on number of unambiguous PSMs
+# resolved when one assignment has a coefficient of variation that 
+ten_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 10) %>%               # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+nine_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 9) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+eight_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 8) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+seven_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 7) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+six_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 6) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+five_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 5) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+four_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 4) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+three_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 3) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+two_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 2) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+
+single_hit_scans <- PSM_hits %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 1) %>%                # Filter groups with more than one occurrence
+  mutate(scan_hit = paste(scan_number, rank_order, sep = "_")) %>%                 
+  ungroup()
+```
+
+Helper functions for processing scans with multiple hits
+
+```{r}
+# Helper functions
+
+# Join hit dataframes
+# When a hit dataframe is missing one ion type or match type in row one the column class gets lost
+# This checks whether the class is character, and corrects it if not
+conditional_merge_hit_df <- function(appended_df, main_df) {
+  if (nrow(appended_df) > 0) {
+    # Check and convert column types for appended_df
+    if (class(appended_df$a_ions_shared) != "character") {
+      appended_df$a_ions_shared <- as.character(appended_df$a_ions_shared)
+    }
+    if (class(appended_df$b_ions_shared) != "character") {
+      appended_df$b_ions_shared <- as.character(appended_df$b_ions_shared)
+    }
+    if (class(appended_df$y_ions_shared) != "character") {
+      appended_df$y_ions_shared <- as.character(appended_df$y_ions_shared)
+    }
+    if (class(appended_df$c_ions_shared) != "character") {
+      appended_df$c_ions_shared <- as.character(appended_df$c_ions_shared)
+    }
+    if (class(appended_df$z_ions_shared) != "character") {
+      appended_df$z_ions_shared <- as.character(appended_df$z_ions_shared)
+    }
+    
+    # Check and convert column types for main_df
+    if (class(main_df$a_ions_shared) != "character") {
+      main_df$a_ions_shared <- as.character(main_df$a_ions_shared)
+    }
+    if (class(main_df$b_ions_shared) != "character") {
+      main_df$b_ions_shared <- as.character(main_df$b_ions_shared)
+    }
+    if (class(main_df$y_ions_shared) != "character") {
+      main_df$y_ions_shared <- as.character(main_df$y_ions_shared)
+    }
+    if (class(main_df$c_ions_shared) != "character") {
+      main_df$c_ions_shared <- as.character(main_df$c_ions_shared)
+    }
+    if (class(main_df$z_ions_shared) != "character") {
+      main_df$z_ions_shared <- as.character(main_df$z_ions_shared)
+    }
+    
+    # Merge the data frames
+    main_df <- main_df %>%
+      bind_rows(appended_df)
+  }
+}
+```
+
+Processing three hit scans to attribute fractional intensity
+
+```{r}
+# First, create a nested dataframe grouped by scan_number
+nested_df <- three_hit_scans %>%
+  group_by(scan_number) %>%
+  nest()
+
+# Calculate the pairwise shared ions for each group and convert to comma-separated strings
+nested_df <- nested_df %>%
+  mutate(
+    rank_12_shared_ions = map(data, ~ {
+      ions_rank_1 <- .x$unique_ions[.x$rank_order == 1][[1]]
+      ions_rank_2 <- .x$unique_ions[.x$rank_order == 2][[1]]
+      intersect(ions_rank_1, ions_rank_2)
+    }),
+    rank_13_shared_ions = map(data, ~ {
+      ions_rank_1 <- .x$unique_ions[.x$rank_order == 1][[1]]
+      ions_rank_3 <- .x$unique_ions[.x$rank_order == 3][[1]]
+      intersect(ions_rank_1, ions_rank_3)
+    })
+  )
+
+# subsetting dataframe for binary comparisons between rank_orders
+three_hit_one_two_scans <- three_hit_scans %>%
+  filter(rank_order %in% c(1, 2)) %>%
+  left_join(nested_df %>% select(scan_number, rank_12_shared_ions), by = "scan_number")
+three_hit_one_three_scans <- three_hit_scans %>%
+  filter(rank_order %in% c(1, 3)) %>%
+  left_join(nested_df %>% select(scan_number, rank_13_shared_ions), by = "scan_number")
+
+# split hits for parallel processing: unique ion intesities
+three_hit_one_two_list <- split(three_hit_one_two_scans, three_hit_one_two_scans$scan_number)
+
+# Initiate cluster
+no_cores <- detectCores() / 2  # Reserve cores
+cl <- makeCluster(no_cores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Export necessary objects and functions
+clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Process the list of dataframes in parallel
+processed_chunks <- parLapply(cl, three_hit_one_two_list, function(df_chunk) {
+  df_chunk %>%
+    rowwise() %>%
+    mutate(rank_12_intensities = list(extract_intensities(scan_number, rank_order, rank_12_shared_ions, grouped_ion_intensity_list))) %>%
+    ungroup()
+})
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the processed chunks back into a single dataframe
+three_hit_one_two_scans <- do.call(rbind, processed_chunks)
+
+# split hits for parallel processing: unique ion intesities
+three_hit_one_three_list <- split(three_hit_one_three_scans, three_hit_one_three_scans$scan_number)
+
+# Initiate cluster
+no_cores <- detectCores() / 2  # Reserve cores
+cl <- makeCluster(no_cores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Export necessary objects and functions
+clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Process the list of dataframes in parallel
+processed_chunks <- parLapply(cl, three_hit_one_three_list, function(df_chunk) {
+  df_chunk %>%
+    rowwise() %>%
+    mutate(rank_13_intensities = list(extract_intensities(scan_number, rank_order, rank_13_shared_ions, grouped_ion_intensity_list))) %>%
+    ungroup()
+})
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the processed chunks back into a single dataframe
+three_hit_one_three_scans <- do.call(rbind, processed_chunks)
+
+# Function to calculate ratios
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  group_by(scan_number) %>%
+  mutate(first_hit_intensities = list(rank_12_intensities[which.min(rank_order)])) %>%
+  ungroup()
+
+# Step 2: Calculate ratios row-wise
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  rowwise() %>%
+  mutate(
+    intensity_ratios = list(
+      map2(
+        rank_12_intensities, 
+        first(first_hit_intensities), 
+        ~ .x / .y
+      )
+    )
+  ) %>%
+  ungroup()
+
+# Function to calculate ratios
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  group_by(scan_number) %>%
+  mutate(first_hit_intensities = list(rank_13_intensities[which.min(rank_order)])) %>%
+  ungroup()
+
+# Step 2: Calculate ratios row-wise
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  rowwise() %>%
+  mutate(
+    intensity_ratios = list(
+      map2(
+        rank_13_intensities, 
+        first(first_hit_intensities), 
+        ~ .x / .y
+      )
+    )
+  ) %>%
+  ungroup()
+
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  rowwise() %>%  # Ensure operations are performed row by row
+  mutate(
+    average_12binary_ratio = {
+      # Flatten the list of numeric vectors from intensity_ratios to a single numeric vector
+      all_ratios <- unlist(intensity_ratios)
+      # Add the value(s) from the 'ratio' column to all_ratios
+      all_ratios_combined <- c(all_ratios, ratio)
+      # Filter out ones from the combined ratios
+      valid_ratios <- all_ratios_combined[all_ratios_combined != 1]
+      # Calculate the average, if there are valid ratios available
+      if (length(valid_ratios) > 0) {
+        mean(valid_ratios)
+      } else {
+        NA_real_  # Return NA if no valid ratios
+      }
+    }
+  ) %>%
+  ungroup()  # Remove rowwise grouping
+
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  rowwise() %>%  # Ensure operations are performed row by row
+  mutate(
+    average_13binary_ratio = {
+      # Flatten the list of numeric vectors from intensity_ratios to a single numeric vector
+      all_ratios <- unlist(intensity_ratios)
+      # Add the value(s) from the 'ratio' column to all_ratios
+      all_ratios_combined <- c(all_ratios, ratio)
+      # Filter out ones from the combined ratios
+      valid_ratios <- all_ratios_combined[all_ratios_combined != 1]
+      # Calculate the average, if there are valid ratios available
+      if (length(valid_ratios) > 0) {
+        mean(valid_ratios)
+      } else {
+        NA_real_  # Return NA if no valid ratios
+      }
+    }
+  ) %>%
+  ungroup()  # Remove rowwise grouping
+
+###
+# Step 1:  calculate total intensity by row, omitting ions used to calculate the ratio between chimeric PSMs
+# This 'total_intensity' is the sum of all non-unique ion intensities shared between multiple unambiguous PSMs
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  rowwise() %>%
+  mutate(total_shared_12_intensity = sum(rank_12_intensities[intensity_ratios == 1])) %>%
+  ungroup()
+
+# Step 2 & 3:  Group by 'scan_number' and calculate the minimum 'total_intensity' for each 'scan_number'
+# The minimum total_shared_intensity 
+min12_intensities <- three_hit_one_two_scans %>%
+  group_by(scan_number) %>%
+  summarise(min12_intensity = min(total_shared_12_intensity)) 
+
+# Step 4: Join this minimum back to the original dataset
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  left_join(min12_intensities, by = "scan_number")
+
+# Filter for rank_order 2 and identify positions of non-one values in 'ratio'
+positions_df <- three_hit_one_two_scans %>%
+  filter(rank_order == 2) %>%
+  mutate(non_one_positions = map(intensity_ratios, ~ which(.x != 1))) %>%
+  select(scan_number, non_one_positions)
+
+# and calculate the sum of matched_intensities at those positions
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  left_join(positions_df, by = "scan_number") %>%
+  mutate(
+    sum_shared12_divergent_intensities = map2_dbl(rank_12_intensities, non_one_positions, ~ sum(.x[.y], na.rm = TRUE))
+  )
+
+###
+# Step 1:  calculate total intensity by row, omitting ions used to calculate the ratio between chimeric PSMs
+# This 'total_intensity' is the sum of all non-unique ion intensities shared between multiple unambiguous PSMs
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  rowwise() %>%
+  mutate(total_shared_13_intensity = sum(rank_13_intensities[intensity_ratios == 1])) %>%
+  ungroup()
+
+# Step 2 & 3:  Group by 'scan_number' and calculate the minimum 'total_intensity' for each 'scan_number'
+# The minimum total_shared_intensity 
+min13_intensities <- three_hit_one_three_scans %>%
+  group_by(scan_number) %>%
+  summarise(min13_intensity = min(total_shared_13_intensity)) 
+
+# Step 4: Join this minimum back to the original dataset
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  left_join(min13_intensities, by = "scan_number")
+
+# Filter for rank_order 2 and identify positions of non-one values in 'ratio'
+positions_df <- three_hit_one_three_scans %>%
+  filter(rank_order == 3) %>%
+  mutate(non_one_positions = map(intensity_ratios, ~ which(.x != 1))) %>%
+  select(scan_number, non_one_positions)
+
+# and calculate the sum of matched_intensities at those positions
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  left_join(positions_df, by = "scan_number") %>%
+  mutate(
+    sum_shared13_divergent_intensities = map2_dbl(rank_13_intensities, non_one_positions, ~ sum(.x[.y], na.rm = TRUE))
+  )
+
+# Allocating unattributed intensity
+# for binary chimeric mixtures
+# total signal = signal A + signal B
+# B/A ratio = x
+# total signal = (1 + x) signal A
+# signal A = total signal / (1 + x)
+# total signal = (1 + (1/x)) signal B
+# signal B = total signal / (1 + (1/x))
+
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  mutate(bin12_ratio = ifelse(is.na(average_12binary_ratio), 1, average_12binary_ratio))
+# establishing ratio specifically for apportioning fractional intensity in this df
+
+three_hit_one_two_scans <- three_hit_one_two_scans %>%
+  group_by(scan_number) %>%
+  mutate(
+    fractional_12_intensity = case_when(
+      rank_order == 1 ~ min12_intensity / (1 + bin12_ratio),
+      rank_order == 2 ~ min12_intensity / (1 + (1 / bin12_ratio)),
+      TRUE ~ NA_real_ # for rank_order beyond the first two, or adjust as needed
+    )
+  ) %>%
+  ungroup() # Always good practice to ungroup after you're done
+
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  mutate(bin13_ratio = ifelse(is.na(average_13binary_ratio), 1, average_13binary_ratio))
+# establishing ratio specifically for apportioning fractional intensity in this df
+
+three_hit_one_three_scans <- three_hit_one_three_scans %>%
+  group_by(scan_number) %>%
+  mutate(
+    fractional_13_intensity = case_when(
+      rank_order == 1 ~ min13_intensity / (1 + bin13_ratio),
+      rank_order == 3 ~ min13_intensity / (1 + (1 / bin13_ratio)),
+      TRUE ~ NA_real_ # for rank_order beyond the first two, or adjust as needed
+    )
+  ) %>%
+  ungroup() # Always good practice to ungroup after you're done
+
+```
+
+Fractional signal intensity attribution for three hit spectra
+
+```{r}
+three_hit_scans <- three_hit_scans %>%
+  left_join(three_hit_one_two_scans %>% select(scan_number, rank_order, rank_12_shared_ions, min12_intensity, sum_shared12_divergent_intensities, fractional_12_intensity, average_12binary_ratio), by = c("scan_number" = "scan_number", "rank_order" = "rank_order"))  %>%
+  left_join(three_hit_one_three_scans %>% select(scan_number, rank_order, rank_13_shared_ions, min13_intensity, sum_shared13_divergent_intensities, fractional_13_intensity, average_13binary_ratio), by = c("scan_number" = "scan_number", "rank_order" = "rank_order"))
+
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    combined_shared_ions = list(c(
+      if (length(rank_12_shared_ions) > 0) rank_12_shared_ions else character(0),
+      if (length(rank_13_shared_ions) > 0) rank_13_shared_ions else character(0)
+    )),
+    remaining_unique_ions = list(setdiff(unique_ions, unlist(combined_shared_ions)))
+  ) %>%
+  ungroup() %>%
+  select(-combined_shared_ions) # Optional: Remove the intermediate combined_shared_ions column if not needed
+
+# Adding ion intensities for remaining unique ions
+# split hits for parallel processing: shared ion intensities
+three_hit_scans_list <- split(three_hit_scans, three_hit_scans$scan_number)
+
+# Initiate cluster
+no_cores <- detectCores() / 2  # Reserve one core
+cl <- makeCluster(no_cores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Export necessary objects and functions
+clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Process the list of dataframes in parallel
+processed_chunks <- parLapply(cl, three_hit_scans_list, function(df_chunk) {
+  df_chunk %>%
+    rowwise() %>%
+    mutate(remaining_unique_ion_intensities = list(extract_intensities(scan_number, rank_order, remaining_unique_ions, grouped_ion_intensity_list))) %>%
+    ungroup()
+})
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the processed chunks back into a single dataframe
+three_hit_scans <- do.call(rbind, processed_chunks)
+
+# Define the custom function
+retrieve_value <- function(rank_order, average_12binary_ratio, average_13binary_ratio, average_ratio) {
+  # Initialize the value to retrieve
+  value_to_retrieve <- NA
+  
+  # Direct use of coalesce depends on rank_order
+  if (rank_order == 1) {
+    value_to_retrieve <- coalesce(average_13binary_ratio, average_12binary_ratio, average_ratio, 1)
+  } else if (rank_order == 2) {
+    # Adjust the order or selection of columns as needed for rank_order == 2
+    value_to_retrieve <- coalesce(average_12binary_ratio, average_ratio, 1)
+  } else if (rank_order == 3) {
+    # Adjust the order or selection of columns as needed for rank_order == 3
+    value_to_retrieve <- coalesce(average_13binary_ratio, average_ratio, 1)
+  } else {
+    # Default case or error handling
+    value_to_retrieve <- NA_real_
+  }
+  
+  return(value_to_retrieve)
+}
+
+# Apply the function row-wise on your dataframe
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(retrieved_value = retrieve_value(rank_order, average_12binary_ratio, average_13binary_ratio, average_ratio)) %>%
+  ungroup()
+
+# Calculating fractional intensity
+# Filter for rank_order 2 and identify positions of non-one values in 'ratio'
+positions_df <- three_hit_scans %>%
+  filter(rank_order == 2) %>%
+  mutate(non_one_pos_rank2 = map(ratio, ~ which(.x != 1))) %>%
+  select(scan_number, non_one_pos_rank2)
+
+# Join position values back to dataframe
+three_hit_scans <- three_hit_scans %>%
+  left_join(positions_df, by = "scan_number")
+
+# Filter for rank_order 3 and identify positions of non-one values in 'ratio'
+positions_df <- three_hit_scans %>%
+  filter(rank_order == 3) %>%
+  mutate(non_one_pos_rank3 = map(ratio, ~ which(.x != 1))) %>%
+  select(scan_number, non_one_pos_rank3)
+
+# Join position values back to dataframe
+three_hit_scans <- three_hit_scans %>%
+  left_join(positions_df, by = "scan_number")
+
+# Merge position value columns
+three_hit_scans <- three_hit_scans %>%
+  mutate(
+    non_one_positions = map2(non_one_pos_rank2, non_one_pos_rank3, ~{
+      combined <- unique(c(.x, .y))
+      if (length(combined) == 0) 0 else combined
+    })
+  )
+# This shows us which ions were unique to one of the hits in the three unambiguous hits
+
+# and calculate the sum of matched_intensities at those positions
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    sum_non_one_ratio_intensities = sum(matched_intensities[unlist(non_one_positions)], na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# We need to calculate total intensity that must be divided among the three unambiguous hits
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    # Check for 0 and handle accordingly for matched_intensities
+    sum_matched_excluded = if (all(non_one_positions == 0)) {
+      sum(matched_intensities, na.rm = TRUE)  # If all values are 0, sum all intensities
+    } else {
+      sum(matched_intensities[-non_one_positions], na.rm = TRUE)
+    },
+    # Check for 0 and handle accordingly for first_hit_intensities
+    sum_first_hit_excluded = if (all(non_one_positions == 0)) {
+      sum(first_hit_intensities[[1]], na.rm = TRUE)  # If all values are 0, sum all intensities
+    } else {
+      sum(first_hit_intensities[[1]][-non_one_positions], na.rm = TRUE)
+    }
+  ) %>%
+  ungroup()
+# For those values that attributable to only two of the three we will have to do another calculation  
+
+# Spread the ratios into separate columns for each rank_order
+three_hit_scans_wide <- three_hit_scans %>%
+  select(scan_number, rank_order, retrieved_value) %>%
+  pivot_wider(
+    names_from = rank_order,
+    values_from = retrieved_value,
+    names_prefix = "rank_order",
+    values_fill = list(retrieved_value = NA),  # Fill missing values with NA
+    # Apply a function to replace NaN with 1
+    values_fn = list(retrieved_value = function(x) ifelse(is.nan(x), 1, x))
+  )
+
+# Join the wide format ratios back to the original dataframe
+three_hit_scans <- three_hit_scans %>%
+  left_join(three_hit_scans_wide, by = "scan_number")
+
+# for ternary chimeric mixtures
+# total signal = signal A + signal B + signal C
+# B/A ratio = x; C/A ratio = y
+# total signal = (1 + x + y) signal A
+# total signal = (1 + x + y) * (signal B / x)
+# total signal = ((1/x) + 1 + (x/y)) * signal B
+# total signal = (1 + x + y) * (signal C / y)
+# total signal = ((1/y) + (y/x) + 1) * signal C
+
+# Calculating fractional intensity
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    fractional_intensity = case_when(
+      rank_order == 1 ~ sum_matched_excluded / sum(rank_order1, rank_order2, rank_order3),
+      rank_order == 2 ~ sum_matched_excluded / sum(rank_order1, (1 / rank_order2), (rank_order3 / rank_order2)),
+      rank_order == 3 ~ sum_matched_excluded / sum(rank_order1, (1 / rank_order3), (rank_order2 / rank_order3)),
+      TRUE ~ NA_real_ # for rank_order beyond the first two, or adjust as needed
+    )
+  )
+
+# Calculate summed intensities from fractional_intensity, sum_matched_intensities and sum of unique_ion_intensities 
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(total_intensity = sum(
+    sum_shared12_divergent_intensities,
+    fractional_12_intensity,
+    sum_shared13_divergent_intensities,
+    fractional_13_intensity,
+    sum(remaining_unique_ion_intensities),
+    sum_non_one_ratio_intensities,
+    fractional_intensity, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+Fractional signal intensity attribution for two hit scans
+
+```{r}
+two_hit_scans <- two_hit_scans[order(two_hit_scans$scan_number, decreasing = FALSE),]
+
+# remove coefficient of variance > 0.5
+two_hit_scans <- two_hit_scans %>%
+  filter(coefficient_of_variance < 0.5 | is.na(coefficient_of_variance))
+
+# resolved when one assignment has a coefficient of variation that 
+single_result <- two_hit_scans %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 1) %>%                 # Filter groups with more than one occurrence
+  ungroup()             
+
+  # Merge the data frames
+  single_hit_scans <- conditional_merge_hit_df(single_hit_scans, single_result)
+
+# resolved when one assignment has a coefficient of variation that 
+two_hit_scans <- two_hit_scans %>%
+  group_by(scan_number) %>%           # Group data by the column of interest
+  filter(n() == 2) %>%                 # Filter groups with more than one occurrence
+  ungroup()
+
+# Step 1:  calculate total intensity by row, omitting ions used to calculate the ratio between chimeric PSMs
+# This 'total_intensity' is the sum of all non-unique ion intensities shared between multiple unambiguous PSMs
+two_hit_scans <- two_hit_scans %>%
+  rowwise() %>%
+  mutate(total_shared_intensity = sum(matched_intensities[ratio == 1])) %>%
+  ungroup()
+
+# Step 2 & 3:  Group by 'scan_number' and calculate the minimum 'total_intensity' for each 'scan_number'
+# The minimum total_shared_intensity 
+min_intensities <- two_hit_scans %>%
+  group_by(scan_number) %>%
+  summarise(min_intensity = min(total_shared_intensity)) 
+
+# Step 4: Join this minimum back to the original dataset
+two_hit_scans <- two_hit_scans %>%
+  left_join(min_intensities, by = "scan_number")
+
+# Calculate the non-one 'ratio' for each 'scan_number' and replace NaN with 1
+# All the 1:1 ratios came through a prior calculation as NaN
+# It might be better to correct this elsewhere, but leaving it in place up until now lets us pull out the averge ratio values with min even when those ratios are greater than 1
+min_average_ratio <- two_hit_scans %>%
+  group_by(scan_number) %>%
+  summarise(min_average_ratio = min(average_ratio, na.rm = TRUE)) %>%
+  mutate(min_average_ratio = if_else(is.infinite(min_average_ratio), 1, min_average_ratio))
+
+# Join this minimum back to the original dataset
+two_hit_scans <- two_hit_scans %>%
+  left_join(min_average_ratio, by = "scan_number")
+
+# assign rank_orders
+two_hit_scans <- two_hit_scans %>%
+  group_by(scan_number) %>%
+  mutate(rank_order = row_number(rank_order)) %>%
+  ungroup() # Always good practice to ungroup after you're done
+
+# for binary chimeric mixtures
+# total signal = signal A + signal B
+# B/A ratio = x
+# total signal = (1 + x) signal A
+# signal A = total signal / (1 + x)
+# total signal = (1 + (1/x)) signal B
+# signal B = total signal / (1 + (1/x))
+
+# Calculating fractional intensity
+two_hit_scans <- two_hit_scans %>%
+  group_by(scan_number) %>%
+  mutate(
+    fractional_intensity = case_when(
+      rank_order == 1 ~ min_intensity / (1 + min_average_ratio),
+      rank_order == 2 ~ min_intensity / (1 + (1 / min_average_ratio)),
+      TRUE ~ NA_real_ # for rank_order beyond the first two, or adjust as needed
+    )
+  ) %>%
+  ungroup() # Always good practice to ungroup after you're done
+
+# Filter for rank_order 2 and identify positions of non-one values in 'ratio'
+positions_df <- two_hit_scans %>%
+  filter(rank_order == 2) %>%
+  mutate(non_one_positions = map(ratio, ~ which(.x != 1))) %>%
+  select(scan_number, non_one_positions)
+
+# and calculate the sum of matched_intensities at those positions
+two_hit_scans <- two_hit_scans %>%
+  left_join(positions_df, by = "scan_number") %>%
+  mutate(
+    sum_matched_intensities = map2_dbl(matched_intensities, non_one_positions, ~ sum(.x[.y], na.rm = TRUE))
+  )
+
+# Calculate summed intensities from fractional_intensity, sum_matched_intensities and sum of unique_ion_intensities 
+two_hit_scans <- two_hit_scans %>%
+  rowwise() %>%
+  mutate(total_intensity = sum(sum(unique_ion_intensities), fractional_intensity, sum_matched_intensities)) %>%
+  ungroup()
+```
+
+Quantifying unambiguous hits
+
+```{r}
+# Order entries
+single_hit_scans <- single_hit_scans[order(single_hit_scans$scan_number, decreasing = FALSE),]
+
+# Adding matched ion intensities to unambiguous hits and calculating total ion intensity
+single_hit_scans <- single_hit_scans %>%
+  rowwise() %>%
+  mutate(total_intensity = sum(matched_intensities)) %>%
+  ungroup()
+```
+
+Merge hit dataframes
+
+```{r}
+column_order = c("scan_number", "rank_order", "PEP.2D", "PID", "all_true", "peptide", "a_ions", "b_ions", "c_ions", "y_ions", "z_ions", "all_ions", "matched_intensities", "total_intensity")
+
+two_hit_scans <- two_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    # Ensure non-NULL inputs and handle possibility of empty vectors
+    all_ions = list(c(a_ions, b_ions, c_ions, y_ions, z_ions))
+  ) %>%
+  mutate(matched_intensities = list(extract_intensities(scan_number, rank_order, all_ions, grouped_ion_intensity_list))) %>%
+  ungroup()
+
+two_hit_scans_backup <- two_hit_scans
+
+two_hit_scans <- two_hit_scans[, column_order]
+
+three_hit_scans_backup <- three_hit_scans
+
+three_hit_scans <- three_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    # Ensure non-NULL inputs and handle possibility of empty vectors
+    all_ions = list(c(a_ions, b_ions, c_ions, y_ions, z_ions))
+  )
+
+# split hits for parallel processing: shared ion intensities
+three_hit_scans_list <- split(three_hit_scans, three_hit_scans$scan_number)
+
+# Initiate cluster
+no_cores <- detectCores() / 2  # Reserve one core
+cl <- makeCluster(no_cores)
+on.exit(stopCluster(cl), add = TRUE)
+
+# Export necessary objects and functions
+clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterEvalQ(cl, {
+  library(dplyr)  # Assuming dplyr is used in your functions
+  library(purrr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Process the list of dataframes in parallel
+processed_chunks <- parLapply(cl, three_hit_scans_list, function(df_chunk) {
+  df_chunk %>%
+    rowwise() %>%
+    mutate(matched_intensities = list(extract_intensities(scan_number, rank_order, all_ions, grouped_ion_intensity_list))) %>%
+    ungroup()
+})
+
+# Stop the cluster
+stopCluster(cl)
+
+# Combine the processed chunks back into a single dataframe
+three_hit_scans <- do.call(rbind, processed_chunks)
+
+three_hit_scans <- three_hit_scans[, column_order]
+
+single_hit_scans <- single_hit_scans %>%
+  rowwise() %>%
+  mutate(
+    # Ensure non-NULL inputs and handle possibility of empty vectors
+    all_ions = list(c(a_ions, b_ions, c_ions, y_ions, z_ions))
+  )
+
+single_hit_scans <- single_hit_scans[, column_order]
+
+assigned_fractional_intensity_hits <- single_hit_scans %>%
+  bind_rows(two_hit_scans)
+
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  bind_rows(three_hit_scans)
+
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits[order(assigned_fractional_intensity_hits$scan_number, decreasing = FALSE),]
+
+combined_results_column_order <- c("scan_number",
+                                   "PID",
+                                   "mod_pos_1",
+                                   "mod_mass_1",
+                                   "mod_pos_2",
+                                   "mod_mass_2",
+                                   "mod_pos_3",
+                                   "mod_mass_3",
+                                   "mod_pos_4",
+                                   "mod_mass_4",
+                                   "mod_pos_5",
+                                   "mod_mass_5",
+                                   "mod_pos_6",
+                                   "mod_mass_6",
+                                   "mod_pos_7",
+                                   "mod_mass_7")
+
+combined_mod_results <- combined_results[, combined_results_column_order]
+
+combined_mod_results <- combined_mod_results %>%
+  mutate(scan_PID = paste(scan_number, PID, sep = "_")) %>%
+  distinct(scan_PID, .keep_all = TRUE)
+
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  left_join(combined_mod_results, by = c("scan_number", "PID")) %>%
+  rowwise() %>%
+  ungroup()
+```
+
+Formatting by PTM type and location
+
+```{r}
+# Example lookup dataframe
+lookup_PTM_df <- data.frame(
+  num_value = c(14.0157, 28.0313, 42.0470, 42.0106, 56.0262, 79.9663, 86.0368, 100.0160, 72.0211, 305.2630), # Your numerical values
+  text_string = c("me1", "me2", "me3", "ac", "prop", "phos", "hb", "su", "lac", "srt") # Corresponding text descriptions
+)
+
+site_df <- data.frame(
+  num_value = c(2, 3, 4, 5, 6, 8, 9, 10, 11, 14, 17, 18, 19, 22, 23, 26, 27, 28, 31, 32, 36), # Your numerical values
+  text_string = c("R", "T", "K", "Q", "T", "R", "K","S", "T", "K", "R", "K", "Q", "T", "K", "R", "K", "S", "S", "T", "Cterm") # Corresponding text descriptions
+)
+
+# Assuming the function checks a single value against the ref_df
+check_against_reference <- function(input_value, ref_df) {
+  if (is.na(input_value)) {
+    return("")  # Or return("") for an empty cell
+  } else {
+    matched_entry <- ref_df %>%
+      filter(num_value == input_value) %>%  # Ensure 'num_value' exactly matches the column name in 'ref_df'
+      pull(text_string)  # Assuming 'text_string' is the column you want to retrieve
+    
+    if (length(matched_entry) == 0) {
+      return("")
+    } else {
+      return(matched_entry)
+    }
+  }
+}
+
+file_name <- paste0("experiment1_all_hits_assigned_fractional_intensity_hits_", save_name_RData_suffix)
+save(assigned_fractional_intensity_hits, file = file_name)
+
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  rowwise() %>%
+  mutate(
+    resi1 = check_against_reference(mod_pos_1, site_df),
+    resi2 = check_against_reference(mod_pos_2, site_df),
+    resi3 = check_against_reference(mod_pos_3, site_df),
+    resi4 = check_against_reference(mod_pos_4, site_df),
+    resi5 = check_against_reference(mod_pos_5, site_df),
+    resi6 = check_against_reference(mod_pos_6, site_df),
+    resi7 = check_against_reference(mod_pos_7, site_df),
+    mod1 = check_against_reference(mod_mass_1, lookup_PTM_df),
+    mod2 = check_against_reference(mod_mass_2, lookup_PTM_df),
+    mod3 = check_against_reference(mod_mass_3, lookup_PTM_df),
+    mod4 = check_against_reference(mod_mass_4, lookup_PTM_df),
+    mod5 = check_against_reference(mod_mass_5, lookup_PTM_df),
+    mod6 = check_against_reference(mod_mass_6, lookup_PTM_df),
+    mod7 = check_against_reference(mod_mass_7, lookup_PTM_df),
+  ) %>%
+  mutate(
+    PTM1 = paste(resi1, mod_pos_1, mod1, sep = ""),
+    PTM2 = paste(resi2, mod_pos_2, mod2, sep = ""),
+    PTM3 = paste(resi3, mod_pos_3, mod3, sep = ""),
+    PTM4 = paste(resi4, mod_pos_4, mod4, sep = ""),
+    PTM5 = paste(resi5, mod_pos_5, mod5, sep = ""),
+    PTM6 = paste(resi6, mod_pos_6, mod6, sep = ""),
+    PTM7 = paste(resi7, mod_pos_7, mod7, sep = "")
+  ) %>%
+  mutate(across(c(PTM1, PTM2, PTM3, PTM4, PTM5, PTM6, PTM7), ~ifelse(. == "NA", NA, .))) %>%
+  mutate(all_mods = pmap_chr(list(PTM1, PTM2, PTM3, PTM4, PTM5, PTM6, PTM7), function(...) {
+    # Combine non-NA elements into a single string
+    paste(na.omit(c(...)), collapse = " ")
+  })) %>%
+  ungroup()
+
+unique_proteoforms <-  as.vector(unique(assigned_fractional_intensity_hits$all_mods, .keep_all = TRUE))
+
+# flatten list columns to strings for preservation when exporting to excel
+assigned_hits_export <- assigned_fractional_intensity_hits %>%
+  mutate(across(where(is.list), ~sapply(., toString)))
+
+setwd(directory)
+file_name <- paste0("experiment1_all_hits_assigned_fractional_intensity_hits_", save_name_csv_suffix)
+write_excel_csv(assigned_hits_export, file = file_name)
+
+H31_assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  filter(str_detect(peptide, "ARTKQTARKSTGGKAPRKQLATKAARKSAPATGGGH"))
+
+H33_assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  filter(str_detect(peptide, "ARTKQTARKSTGGKAPRKQLATKAARKSAPSTGGGH"))
+
+# Another approach is to serialize list-containing rows as JSON strings. JSON can preserve the nested structure of lists and is more suited for conveying complex data structures than CSV
+#library(jsonlite)
+
+# Convert each row to a JSON string
+#json_strings <- apply(assigned_fractional_intensity_hits, 1, toJSON, auto_unbox = TRUE)
+
+# If you want to put these strings in a dataframe and then write to CSV for Excel:
+#json_df <- data.frame(json = json_strings)
+```
+
+TMT calculations
+
+```{r}
+assigned_fractional_intensity_backup <- assigned_fractional_intensity_hits
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_backup
+
+# Function for extracting TMT ion intensities
+find_intensities_for_scan <- function(scan_number, mz, target_mz, ppm_tolerance) {
+  # Convert the scan number to an integer if necessary
+  scan_number_int <- as.integer(scan_number)
+  
+  # Retrieve the peaks data for the given scan number from the mz object
+  scan_data <- peaks(mz, scan = scan_number_int)
+  
+  # Proceed to find intensities within the tolerance for the target m/z values
+  intensities <- sapply(target_mz, function(mz) {
+    tolerance <- calculate_tolerance(mz, ppm_tolerance)
+    idx <- which(scan_data[, 1] >= mz - tolerance & scan_data[, 1] <= mz + tolerance)
+    
+    if (length(idx) > 0) {
+      # Calculate distances for all matches
+      distances <- abs(scan_data[idx, 1] - mz)
+      # Select the index with the smallest distance
+      closest_match_idx <- idx[which.min(distances)]
+      return(scan_data[closest_match_idx, 2])  # Returning the intensity of the closest match
+    } else {
+      return(NA)  # Return NA if no matches are found
+    }
+  })
+  
+  return(intensities)
+}
+
+mz <- experiment1_mz
+
+# Extract raw TMT signals
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  rowwise() %>%
+  mutate('126_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[1], ppm_tolerance)),
+         '127_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[2], ppm_tolerance)),
+         '128_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[3], ppm_tolerance)),
+         '129_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[4], ppm_tolerance)),
+         '130_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[5], ppm_tolerance)),
+         '131_intensity' = as.numeric(find_intensities_for_scan(scan_number, mz, TMT_ETD_mz_values[6], ppm_tolerance))
+  )
+
+# Function to identify rows with => 5 TMT signals
+TMT_check <- function(data, col_range_start, col_range_end, TMT_count) {
+  # Dynamically select the range of columns
+  columns_to_check <- data %>% select(dplyr::all_of(col_range_start):dplyr::all_of(col_range_end))
+  
+  # Apply the check across the specified columns and count how many satisfy the condition
+  columns_check_result <- purrr::map_lgl(columns_to_check, ~any(.x > 0, na.rm = TRUE))
+  
+  # Return TRUE if at least 5 columns meet the criteria
+  sum(columns_check_result) >= TMT_count
+}
+
+# Identifying rows with => 5 TMT signals
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  rowwise() %>%
+  mutate('5_TMT' = TMT_check(cur_data(), '126_intensity', '131_intensity', 5)) %>%
+  mutate('6_TMT' = TMT_check(cur_data(), '126_intensity', '131_intensity', 6)) %>%
+  ungroup()
+
+# Applying isotopic corrections from manufacturer CoA from TMT batch
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  rowwise() %>%
+  mutate(
+    `126_corrected` = (`126_intensity` * TMT126[3]) - sum(c(`127_intensity` * TMT126[4],
+                                                            `128_intensity` * TMT126[5]),
+                                                          na.rm = TRUE),
+    `127_corrected` = (`127_intensity` * TMT127[3]) - sum(c(`126_intensity` * TMT127[2],
+                                                            `128_intensity` * TMT127[4],
+                                                            `129_intensity` * TMT127[5]),
+                                                          na.rm = TRUE),
+    `128_corrected` = (`128_intensity` * TMT128[3]) - sum(c(`126_intensity` * TMT128[1],
+                                                            `127_intensity` * TMT128[2],
+                                                            `129_intensity` * TMT128[4],
+                                                            `130_intensity` * TMT128[5]),
+                                                          na.rm = TRUE),
+    `129_corrected` = (`129_intensity` * TMT129[3]) - sum(c(`127_intensity` * TMT129[1],
+                                                            `128_intensity` * TMT129[2],
+                                                            `130_intensity` * TMT129[4],
+                                                            `131_intensity` * TMT129[5]),
+                                                          na.rm = TRUE),
+    `130_corrected` = (`130_intensity` * TMT130[3]) - sum(c(`128_intensity` * TMT130[1],
+                                                            `129_intensity` * TMT130[2],
+                                                            `131_intensity` * TMT130[4]),
+                                                          na.rm = TRUE),
+    `131_corrected` = (`131_intensity` * TMT131[3]) - sum(c(`129_intensity` * TMT131[1],
+                                                            `130_intensity` * TMT131[2]),
+                                                          na.rm = TRUE)
+  )
+
+# Remove duplicate scans for calculating channel mean, median, etc.
+TMT_single_scan_df <- assigned_fractional_intensity_hits %>%
+  distinct(scan_number, .keep_all = TRUE)
+```
+
+TMT signal normalization
+
+```{r}
+# CUMULATIVE NORMALIZATION
+# Calculating individual channel intensities for PSMs
+PSM_TMT126_total_channel_signal <- sum(TMT_single_scan_df$`126_corrected`, na.rm = TRUE)
+PSM_TMT127_total_channel_signal <- sum(TMT_single_scan_df$`127_corrected`, na.rm = TRUE)
+PSM_TMT128_total_channel_signal <- sum(TMT_single_scan_df$`128_corrected`, na.rm = TRUE)
+PSM_TMT129_total_channel_signal <- sum(TMT_single_scan_df$`129_corrected`, na.rm = TRUE)
+PSM_TMT130_total_channel_signal <- sum(TMT_single_scan_df$`130_corrected`, na.rm = TRUE)
+PSM_TMT131_total_channel_signal <- sum(TMT_single_scan_df$`131_corrected`, na.rm = TRUE)
+
+# Calculating channel normalization factors
+cumulative_channel_signals <- c(PSM_TMT126_total_channel_signal,
+                                PSM_TMT127_total_channel_signal,
+                                PSM_TMT128_total_channel_signal,
+                                PSM_TMT129_total_channel_signal,
+                                PSM_TMT130_total_channel_signal,
+                                PSM_TMT131_total_channel_signal)
+
+max_cumulative_signal <- max(cumulative_channel_signals)
+
+cumulative_channel_norm <- (cumulative_channel_signals / max_cumulative_signal)
+
+# Normalizing individual channel intensities for PSMs
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( `126_cum_normalized` = `126_corrected` / cumulative_channel_norm[1],
+          `127_cum_normalized` = `127_corrected` / cumulative_channel_norm[2],
+          `128_cum_normalized` = `128_corrected` / cumulative_channel_norm[3],
+          `129_cum_normalized` = `129_corrected` / cumulative_channel_norm[4],
+          `130_cum_normalized` = `130_corrected` / cumulative_channel_norm[5],
+          `131_cum_normalized` = `131_corrected` / cumulative_channel_norm[6],
+  ) %>%
+  ungroup()
+
+# log2 transform
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( log2_cum_126 = log2(`126_cum_normalized`),
+          log2_cum_127 = log2(`127_cum_normalized`),
+          log2_cum_128 = log2(`128_cum_normalized`),
+          log2_cum_129 = log2(`129_cum_normalized`),
+          log2_cum_130 = log2(`130_cum_normalized`),
+          log2_cum_131 = log2(`131_cum_normalized`),
+  ) %>%
+  ungroup()
+
+# MEAN NORMALIZATION
+# Calculating individual channel intensities for PSMs
+PSM_TMT126_mean_channel_signal <- mean(TMT_single_scan_df$`126_corrected`, na.rm = TRUE)
+PSM_TMT127_mean_channel_signal <- mean(TMT_single_scan_df$`127_corrected`, na.rm = TRUE)
+PSM_TMT128_mean_channel_signal <- mean(TMT_single_scan_df$`128_corrected`, na.rm = TRUE)
+PSM_TMT129_mean_channel_signal <- mean(TMT_single_scan_df$`129_corrected`, na.rm = TRUE)
+PSM_TMT130_mean_channel_signal <- mean(TMT_single_scan_df$`130_corrected`, na.rm = TRUE)
+PSM_TMT131_mean_channel_signal <- mean(TMT_single_scan_df$`131_corrected`, na.rm = TRUE)
+
+# Calculating channel normalization factors
+mean_channel_signals <- c(PSM_TMT126_mean_channel_signal,
+                          PSM_TMT127_mean_channel_signal,
+                          PSM_TMT128_mean_channel_signal,
+                          PSM_TMT129_mean_channel_signal,
+                          PSM_TMT130_mean_channel_signal,
+                          PSM_TMT131_mean_channel_signal)
+
+max_mean_signal <- max(mean_channel_signals)
+
+mean_channel_norm <- (mean_channel_signals / max_mean_signal)
+
+# Normalizing individual channel intensities for PSMs
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( `126_mean_normalized` = `126_corrected` / mean_channel_norm[1],
+          `127_mean_normalized` = `127_corrected` / mean_channel_norm[2],
+          `128_mean_normalized` = `128_corrected` / mean_channel_norm[3],
+          `129_mean_normalized` = `129_corrected` / mean_channel_norm[4],
+          `130_mean_normalized` = `130_corrected` / mean_channel_norm[5],
+          `131_mean_normalized` = `131_corrected` / mean_channel_norm[6],
+  ) %>%
+  ungroup()
+
+# log2 transform
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( log2_mean_126 = log2(`126_mean_normalized`),
+          log2_mean_127 = log2(`127_mean_normalized`),
+          log2_mean_128 = log2(`128_mean_normalized`),
+          log2_mean_129 = log2(`129_mean_normalized`),
+          log2_mean_130 = log2(`130_mean_normalized`),
+          log2_mean_131 = log2(`131_mean_normalized`),
+  ) %>%
+  ungroup()
+
+# MEDIAN NORMALIZATION
+# Calculating individual channel intensities for PSMs
+PSM_TMT126_med_channel_signal <- median(TMT_single_scan_df$`126_corrected`, na.rm = TRUE)
+PSM_TMT127_med_channel_signal <- median(TMT_single_scan_df$`127_corrected`, na.rm = TRUE)
+PSM_TMT128_med_channel_signal <- median(TMT_single_scan_df$`128_corrected`, na.rm = TRUE)
+PSM_TMT129_med_channel_signal <- median(TMT_single_scan_df$`129_corrected`, na.rm = TRUE)
+PSM_TMT130_med_channel_signal <- median(TMT_single_scan_df$`130_corrected`, na.rm = TRUE)
+PSM_TMT131_med_channel_signal <- median(TMT_single_scan_df$`131_corrected`, na.rm = TRUE)
+
+# Calculating channel normalization factors
+median_channel_signals <- c(PSM_TMT126_med_channel_signal,
+                          PSM_TMT127_med_channel_signal,
+                          PSM_TMT128_med_channel_signal,
+                          PSM_TMT129_med_channel_signal,
+                          PSM_TMT130_med_channel_signal,
+                          PSM_TMT131_med_channel_signal)
+
+max_med_signal <- max(median_channel_signals)
+
+median_channel_norm <- (median_channel_signals / max_med_signal)
+
+# Normalizing individual channel intensities for PSMs
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( `126_median_normalized` = `126_corrected` / median_channel_norm[1],
+          `127_median_normalized` = `127_corrected` / median_channel_norm[2],
+          `128_median_normalized` = `128_corrected` / median_channel_norm[3],
+          `129_median_normalized` = `129_corrected` / median_channel_norm[4],
+          `130_median_normalized` = `130_corrected` / median_channel_norm[5],
+          `131_median_normalized` = `131_corrected` / median_channel_norm[6],
+  ) %>%
+  ungroup()
+
+# log2 transform
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  rowwise() %>%
+  mutate( log2_median_126 = log2(`126_median_normalized`),
+          log2_median_127 = log2(`127_median_normalized`),
+          log2_median_128 = log2(`128_median_normalized`),
+          log2_median_129 = log2(`129_median_normalized`),
+          log2_median_130 = log2(`130_median_normalized`),
+          log2_median_131 = log2(`131_median_normalized`),
+  ) %>%
+  ungroup()
+
+```
+
+Comparing changes among samples following normalization
+
+```{r}
+# CUMULATIVE
+# Using the t.test function in R to compare log2 transformed data
+TMT_cumulative_ttest_df <- TMT_single_scan_df %>%
+  group_by(scan_number)  %>%
+  summarise(
+    cum_t_test = list(tryCatch({
+      t.test(c_across(c("log2_cum_126", "log2_cum_127", "log2_cum_128")),
+             c_across(c("log2_cum_129", "log2_cum_130", "log2_cum_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  ) # From t.test() default is "two.sided" (versus "less" or "greater")
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_cumulative_ttest_df <- TMT_cumulative_ttest_df %>%
+  mutate(
+    cum_p_value = map_dbl(cum_t_test, ~.x$p.value),
+    cum_t_statistic = map_dbl(cum_t_test, ~.x$statistic),
+    cum_conf_low = map_dbl(cum_t_test, ~.x$conf.int[1]),
+    cum_conf_high = map_dbl(cum_t_test, ~.x$conf.int[2]),
+    cum_estimate_mean_x = map_dbl(cum_t_test, ~.x$estimate['mean of x']),
+    cum_estimate_mean_y = map_dbl(cum_t_test, ~.x$estimate['mean of y'])
+  )  
+
+# joining the ttest_df to the single_scan_df
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  left_join(TMT_cumulative_ttest_df, by = "scan_number") %>%
+  ungroup()
+
+# MEAN
+# Using the t.test function in R to compare log2 transformed data
+TMT_mean_ttest_df <- TMT_single_scan_df %>%
+  group_by(scan_number)  %>%
+  summarise(
+    mean_t_test = list(tryCatch({
+      t.test(c_across(c("log2_mean_126", "log2_mean_127", "log2_mean_128")),
+             c_across(c("log2_mean_129", "log2_mean_130", "log2_mean_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  )
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_mean_ttest_df <- TMT_mean_ttest_df %>%
+  mutate(
+    mean_p_value = map_dbl(mean_t_test, ~.x$p.value),
+    mean_t_statistic = map_dbl(mean_t_test, ~.x$statistic),
+    mean_conf_low = map_dbl(mean_t_test, ~.x$conf.int[1]),
+    mean_conf_high = map_dbl(mean_t_test, ~.x$conf.int[2]),
+    mean_estimate_mean_x = map_dbl(mean_t_test, ~.x$estimate['mean of x']),
+    mean_estimate_mean_y = map_dbl(mean_t_test, ~.x$estimate['mean of y'])
+  )  
+
+# joining the ttest_df to the single_scan_df
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  left_join(TMT_mean_ttest_df, by = "scan_number") %>%
+  ungroup()
+
+# MEDIAN
+# Using the t.test function in R to compare log2 transformed data
+TMT_median_ttest_df <- TMT_single_scan_df %>%
+  group_by(scan_number)  %>%
+  summarise(
+    median_t_test = list(tryCatch({
+      t.test(c_across(c("log2_median_126", "log2_median_127", "log2_median_128")),
+             c_across(c("log2_median_129", "log2_median_130", "log2_median_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  )
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_median_ttest_df <- TMT_median_ttest_df %>%
+  mutate(
+    median_p_value = map_dbl(median_t_test, ~.x$p.value),
+    median_t_statistic = map_dbl(median_t_test, ~.x$statistic),
+    median_conf_low = map_dbl(median_t_test, ~.x$conf.int[1]),
+    median_conf_high = map_dbl(median_t_test, ~.x$conf.int[2]),
+    median_estimate_mean_x = map_dbl(median_t_test, ~.x$estimate['mean of x']),
+    median_estimate_mean_y = map_dbl(median_t_test, ~.x$estimate['mean of y'])
+  )  
+
+# joining the ttest_df to the single_scan_df
+TMT_single_scan_df <- TMT_single_scan_df %>%
+  left_join(TMT_median_ttest_df, by = "scan_number") %>%
+  ungroup()
+
+# define columns for ttest_summary
+column_order = c("scan_number", "126_cum_normalized", "127_cum_normalized", "128_cum_normalized", "129_cum_normalized", "130_cum_normalized", "131_cum_normalized", "log2_cum_126", "log2_cum_127", "log2_cum_128", "log2_cum_129", "log2_cum_130", "log2_cum_131", "126_mean_normalized", "127_mean_normalized", "128_mean_normalized", "129_mean_normalized", "130_mean_normalized", "131_mean_normalized", "log2_mean_126", "log2_mean_127", "log2_mean_128", "log2_mean_129", "log2_mean_130", "log2_mean_131", "126_median_normalized", "127_median_normalized", "128_median_normalized", "129_median_normalized", "130_median_normalized", "131_median_normalized", "log2_median_126", "log2_median_127", "log2_median_128", "log2_median_129", "log2_median_130", "log2_median_131", "cum_t_test", "cum_p_value", "cum_t_statistic", "cum_conf_low", "cum_conf_high", "cum_estimate_mean_x", "cum_estimate_mean_y", "mean_t_test", "mean_p_value", "mean_t_statistic", "mean_conf_low", "mean_conf_high", "mean_estimate_mean_x", "mean_estimate_mean_y", "median_t_test", "median_p_value", "median_t_statistic", "median_conf_low", "median_conf_high", "median_estimate_mean_x", "median_estimate_mean_y")
+
+TMT_ttest_summary_df <- TMT_single_scan_df[, column_order]
+    
+# join results back to assigned_fractional_intensity_hits
+assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
+  group_by(scan_number) %>%
+  left_join(TMT_ttest_summary_df, by = "scan_number") %>%
+  ungroup()
+
+total_PSM_intensity <- sum(assigned_fractional_intensity_hits$total_intensity)
+
+# Export RData version of analyzed hits
+setwd(directory)
+file_name <- paste0("experiment1_all_hits_assigned_fractional_intensity_hits_", save_name_RData_suffix)
+save(assigned_fractional_intensity_hits, file = file_name)
+
+# flatten list columns to strings for preservation when exporting to excel
+assigned_hits_export <- assigned_fractional_intensity_hits %>%
+  mutate(across(where(is.list), ~sapply(., toString)))
+
+# Export excel .csv of analyzed hits
+file_name <- paste0("experiment1_all_hits_assigned_fractional_intensity_hits_", save_name_csv_suffix)
+write_excel_csv(assigned_hits_export, file = file_name)
+```
+
+Combining all single measurements of specific proteoforms and repeating t-test on aggregated data
+
+```{r}
+one_hit_vector <- as.vector(single_hit_scans$scan_number)
+
+# CUMULATIVE
+# Using the t.test function in R to compare log2 transformed data
+TMT_cumulative_hit_grouped_ttest_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  summarise(
+    cum_t_test = list(tryCatch({
+      t.test(c_across(c("log2_cum_126", "log2_cum_127", "log2_cum_128")),
+             c_across(c("log2_cum_129", "log2_cum_130", "log2_cum_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  ) # From t.test() default is "two.sided" (versus "less" or "greater")
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_cumulative_hit_grouped_ttest_df <- TMT_cumulative_hit_grouped_ttest_df %>%
+  mutate(
+    cum_p_value = map_dbl(cum_t_test, ~.x$p.value),
+    cum_t_statistic = map_dbl(cum_t_test, ~.x$statistic),
+    cum_conf_low = map_dbl(cum_t_test, ~.x$conf.int[1]),
+    cum_conf_high = map_dbl(cum_t_test, ~.x$conf.int[2]),
+    cum_estimate_mean_x = map_dbl(cum_t_test, ~.x$estimate['mean of x']),
+    cum_estimate_mean_y = map_dbl(cum_t_test, ~.x$estimate['mean of y'])
+  )  
+
+TMT_cumulative_hit_grouped_fc_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  mutate( `fc_cum` = (mean(c_across(c("log2_cum_129", "log2_cum_130", "log2_cum_131")), na.rm = TRUE) - mean(c_across(c("log2_cum_126", "log2_cum_127", "log2_cum_128")), na.rm = TRUE)))
+
+TMT_cumulative_hit_grouped_fc_df <- TMT_cumulative_hit_grouped_fc_df %>%
+  distinct(TMT_cumulative_hit_grouped_fc_df$all_mods, .keep_all = TRUE)
+
+column_order = c("all_mods", "fc_cum")
+
+TMT_cumulative_hit_grouped_fc_df <- TMT_cumulative_hit_grouped_fc_df[, column_order]
+
+# joining the ttest_df to the single_scan_df
+TMT_cumulative_hit_grouped_ttest_df <- TMT_cumulative_hit_grouped_ttest_df %>%
+  group_by(all_mods)  %>%
+  left_join(TMT_cumulative_hit_grouped_fc_df, by = "all_mods") %>%
+  filter(!(is.na(cum_p_value))) %>%
+  mutate(change = case_when(
+    fc_cum < -0.6 & cum_p_value < 0.05 ~ "DOWN",
+    abs(fc_cum) <= 0.6 | cum_p_value > 0.5 ~ "NO",
+    fc_cum > 0.6 & cum_p_value < 0.05 ~ "UP",
+    TRUE ~ "NO"
+  )) %>%
+  ungroup()
+
+TMT_cumulative_hit_grouped_ttest_df <- TMT_cumulative_hit_grouped_ttest_df %>%
+  mutate(label_cond = case_when(
+    change %in% c("UP", "DOWN") & str_replace(all_mods, "Cterm36srt", "") == "" ~ "unmodified",
+    change %in% c("UP", "DOWN") ~ str_replace(all_mods, "Cterm36srt", ""),
+    TRUE ~ ""
+  ))
+
+# MEAN
+# Using the t.test function in R to compare log2 transformed data
+TMT_mean_hit_grouped_ttest_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  summarise(
+    mean_t_test = list(tryCatch({
+      t.test(c_across(c("log2_mean_126", "log2_mean_127", "log2_mean_128")),
+             c_across(c("log2_mean_129", "log2_mean_130", "log2_mean_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  ) # From t.test() default is "two.sided" (versus "less" or "greater")
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_mean_hit_grouped_ttest_df <- TMT_mean_hit_grouped_ttest_df %>%
+  mutate(
+    mean_p_value = map_dbl(mean_t_test, ~.x$p.value),
+    mean_t_statistic = map_dbl(mean_t_test, ~.x$statistic),
+    mean_conf_low = map_dbl(mean_t_test, ~.x$conf.int[1]),
+    mean_conf_high = map_dbl(mean_t_test, ~.x$conf.int[2]),
+    mean_estimate_mean_x = map_dbl(mean_t_test, ~.x$estimate['mean of x']),
+    mean_estimate_mean_y = map_dbl(mean_t_test, ~.x$estimate['mean of y'])
+  )  
+
+TMT_mean_hit_grouped_fc_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  mutate( `fc_mean` = (mean(c_across(c("log2_mean_129", "log2_mean_130", "log2_mean_131")), na.rm = TRUE) - mean(c_across(c("log2_mean_126", "log2_mean_127", "log2_mean_128")), na.rm = TRUE)))
+
+TMT_mean_hit_grouped_fc_df <- TMT_mean_hit_grouped_fc_df %>%
+  distinct(TMT_mean_hit_grouped_fc_df$all_mods, .keep_all = TRUE)
+
+column_order = c("all_mods", "fc_mean")
+
+TMT_mean_hit_grouped_fc_df <- TMT_mean_hit_grouped_fc_df[, column_order]
+
+# joining the ttest_df to the single_scan_df
+TMT_mean_hit_grouped_ttest_df <- TMT_mean_hit_grouped_ttest_df %>%
+  group_by(all_mods)  %>%
+  left_join(TMT_mean_hit_grouped_fc_df, by = "all_mods") %>%
+  filter(!(is.na(mean_p_value))) %>%
+  mutate(change = case_when(
+    fc_mean < -0.6 & mean_p_value < 0.05 ~ "DOWN",
+    abs(fc_mean) <= 0.6 | mean_p_value > 0.5 ~ "NO",
+    fc_mean > 0.6 & mean_p_value < 0.05 ~ "UP",
+    TRUE ~ "NO"
+  )) %>%
+  ungroup()
+
+TMT_mean_hit_grouped_ttest_df <- TMT_mean_hit_grouped_ttest_df %>%
+  mutate(label_cond = case_when(
+    change %in% c("UP", "DOWN") & str_replace(all_mods, "Cterm36srt", "") == "" ~ "unmodified",
+    change %in% c("UP", "DOWN") ~ str_replace(all_mods, "Cterm36srt", ""),
+    TRUE ~ ""
+  ))
+
+# MEDIAN
+# Using the t.test function in R to compare log2 transformed data
+TMT_median_hit_grouped_ttest_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  summarise(
+    median_t_test = list(tryCatch({
+      t.test(c_across(c("log2_median_126", "log2_median_127", "log2_median_128")),
+             c_across(c("log2_median_129", "log2_median_130", "log2_median_131")))
+    }, error = function(e) {
+      list(p.value = NA, statistic = NA, conf.int = c(NA, NA), estimate = c(NA, NA))
+    }))
+  ) # From t.test() default is "two.sided" (versus "less" or "greater")
+
+# extracting the t-test results in their own dataframe because it didn't work after merging the ttest_df with the single_scan_df
+TMT_median_hit_grouped_ttest_df <- TMT_median_hit_grouped_ttest_df %>%
+  mutate(
+    median_p_value = map_dbl(median_t_test, ~.x$p.value),
+    median_t_statistic = map_dbl(median_t_test, ~.x$statistic),
+    median_conf_low = map_dbl(median_t_test, ~.x$conf.int[1]),
+    median_conf_high = map_dbl(median_t_test, ~.x$conf.int[2]),
+    median_estimate_mean_x = map_dbl(median_t_test, ~.x$estimate['mean of x']),
+    median_estimate_mean_y = map_dbl(median_t_test, ~.x$estimate['mean of y'])
+  )  
+
+TMT_median_hit_grouped_fc_df <- assigned_fractional_intensity_hits %>%
+  filter(scan_number %in% one_hit_vector) %>%
+  group_by(all_mods)  %>%
+  mutate( `fc_median` = (mean(c_across(c("log2_median_129", "log2_median_130", "log2_median_131")), na.rm = TRUE) - mean(c_across(c("log2_median_126", "log2_median_127", "log2_median_128")), na.rm = TRUE)))
+
+TMT_median_hit_grouped_fc_df <- TMT_median_hit_grouped_fc_df %>%
+  distinct(TMT_median_hit_grouped_fc_df$all_mods, .keep_all = TRUE)
+
+column_order = c("all_mods", "fc_median")
+
+TMT_median_hit_grouped_fc_df <- TMT_median_hit_grouped_fc_df[, column_order]
+
+# joining the ttest_df to the single_scan_df
+TMT_median_hit_grouped_ttest_df <- TMT_median_hit_grouped_ttest_df %>%
+  group_by(all_mods)  %>%
+  left_join(TMT_median_hit_grouped_fc_df, by = "all_mods") %>%
+  filter(!(is.na(median_p_value))) %>%
+  mutate(change = case_when(
+    fc_median < -0.6 & median_p_value < 0.05 ~ "DOWN",
+    abs(fc_median) <= 0.6 | median_p_value > 0.5 ~ "NO",
+    fc_median > 0.6 & median_p_value < 0.05 ~ "UP",
+    TRUE ~ "NO"
+  )) %>%
+  ungroup()
+
+TMT_median_hit_grouped_ttest_df <- TMT_median_hit_grouped_ttest_df %>%
+  mutate(label_cond = case_when(
+    change %in% c("UP", "DOWN") & str_replace(all_mods, "Cterm36srt", "") == "" ~ "unmodified",
+    change %in% c("UP", "DOWN") ~ str_replace(all_mods, "Cterm36srt", ""),
+    TRUE ~ ""
+  ))
+
+# Export RData version of t-test analysis
+setwd(directory)
+file_name <- paste0("experiment1_all_hits_cumulative_ttest_", save_name_RData_suffix)
+save(TMT_cumulative_hit_grouped_ttest_df, file = file_name)
+file_name <- paste0("experiment1_all_hits_mean_ttest_", save_name_RData_suffix)
+save(TMT_mean_hit_grouped_ttest_df, file = file_name)
+file_name <- paste0("experiment1_all_hits_median_ttest_", save_name_RData_suffix)
+save(TMT_median_hit_grouped_ttest_df, file = file_name)
+```
+
+Quantifying proteoforms for further description of species with significant fold changes
+
+```{r}
+proteoform_intensity_df <- assigned_fractional_intensity_hits %>%
+  group_by(all_mods) %>%
+  mutate( proteoform_intensity = sum(total_intensity)) %>%
+  ungroup()
+
+column_order <- c("scan_number", "PID", "all_mods", "total_intensity", "proteoform_intensity")
+
+proteoform_intensity_df <- proteoform_intensity_df[, column_order]
+
+proteoform_intensity_df <- proteoform_intensity_df %>%
+  filter(proteoform_intensity_df$all_mods %in% unique(proteoform_intensity_df$all_mods))
+
+# CUMULATIVE
+proteoform_cumulative_vector <- as.vector(TMT_cumulative_hit_grouped_fc_df$all_mods)
+
+proteoform_intensity_cumulative_df <- data.frame(proteoform_cumulative_vector)
+
+names(proteoform_intensity_cumulative_df) <- c("all_mods")
+
+proteoform_intensity_cumulative_df<- proteoform_intensity_cumulative_df %>%
+  left_join(proteoform_intensity_df, by = "all_mods") %>%
+  distinct(all_mods, .keep_all = TRUE) %>%
+  left_join(TMT_cumulative_hit_grouped_ttest_df, by = "all_mods") %>%
+  rowwise() %>%
+  mutate( ctrl_int = (1 / (2^(fc_cum) + 1)) * proteoform_intensity,
+          var_int = ((2^(fc_cum)) / (2^(fc_cum) + 1)) * proteoform_intensity
+  ) %>%
+  mutate( ctrl_percent = ctrl_int / total_PSM_intensity,
+          var_percent = var_int / total_PSM_intensity) %>%
+  mutate("var_abundance" = var_percent) %>%
+  ungroup() %>%
+  filter(!(is.na(cum_p_value))) 
+
+# confirmed that summation is working correctly (see below)
+# sum(proteoform_intensity_cumulative_df$total_intensity[1:109])
+
+# MEAN
+proteoform_mean_vector <- as.vector(TMT_mean_hit_grouped_fc_df$all_mods)
+
+proteoform_intensity_mean_df <- data.frame(proteoform_mean_vector)
+
+names(proteoform_intensity_mean_df) <- c("all_mods")
+
+proteoform_intensity_mean_df<- proteoform_intensity_mean_df %>%
+  left_join(proteoform_intensity_df, by = "all_mods") %>%
+  distinct(all_mods, .keep_all = TRUE) %>%
+  left_join(TMT_mean_hit_grouped_ttest_df, by = "all_mods") %>%
+  rowwise() %>%
+  mutate( ctrl_int = (1 / (2^(fc_mean) + 1)) * proteoform_intensity,
+          var_int = ((2^(fc_mean)) / (2^(fc_mean) + 1)) * proteoform_intensity
+  ) %>%
+  mutate( ctrl_percent = ctrl_int / total_PSM_intensity,
+          var_percent = var_int / total_PSM_intensity) %>%
+  mutate("var_abundance" = var_percent) %>%
+  ungroup() %>%
+  filter(!(is.na(mean_p_value)))
+
+# MEDIAN
+proteoform_median_vector <- as.vector(TMT_median_hit_grouped_fc_df$all_mods)
+
+proteoform_intensity_median_df <- data.frame(proteoform_median_vector)
+
+names(proteoform_intensity_median_df) <- c("all_mods")
+
+proteoform_intensity_median_df<- proteoform_intensity_median_df %>%
+  left_join(proteoform_intensity_df, by = "all_mods") %>%
+  distinct(all_mods, .keep_all = TRUE) %>%
+  left_join(TMT_median_hit_grouped_ttest_df, by = "all_mods") %>%
+  rowwise() %>%
+  mutate( ctrl_int = (1 / (2^(fc_median) + 1)) * proteoform_intensity,
+          var_int = ((2^(fc_median)) / (2^(fc_median) + 1)) * proteoform_intensity
+  ) %>%
+  mutate( ctrl_percent = ctrl_int / total_PSM_intensity,
+          var_percent = var_int / total_PSM_intensity) %>%
+  mutate("var_abundance" = var_percent) %>%
+  ungroup()%>%
+  filter(!(is.na(median_p_value)))
+```
+
+Plotting
+
+```{r}
+# CUMULATIVE
+experiment1_cumulative_norm_volcano_plot <- ggplot(data = TMT_cumulative_hit_grouped_ttest_df, aes(x = fc_cum, y = -log10(cum_p_value), col = change, label = label_cond)) +
+  geom_vline(xintercept = c(-0.6, 0.6), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#00AFBB", "grey", "#bb0c00"), # to set the colours of our variable
+                       labels = c("Decreased", "No significant change", "Increased")) + # to set the labels in case we want to overwrite the categories from the dataframe (UP, DOWN, NO)
+  coord_cartesian(ylim = c(0, 50), xlim = c(-3, 3)) + # since some genes can have minuslog10padj of inf, we set these limits
+  labs(color = 'Proteoform Change', #legend_title
+       x = expression("log"[2]*"FC"), y = expression("-log"[10]*"p-value")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) + # to customise the breaks in the x axis
+  ggtitle('Proteoforms changed on experiment1 treatment - cumulative normalization') + # Plot title
+  geom_text_repel(
+    size = 3, 
+    max.overlaps = Inf,
+    #nudge_x = 0.05, 
+    nudge_y = 0.15,
+    point.padding = unit(0.4, "lines"),  # adjust based on your specific plot's scale
+    box.padding = unit(0.4, "lines")
+  ) # To show all labels
+
+# MEAN
+experiment1_mean_norm_volcano_plot <- ggplot(data = TMT_mean_hit_grouped_ttest_df, aes(x = fc_mean, y = -log10(mean_p_value), col = change, label = label_cond)) +
+  geom_vline(xintercept = c(-0.6, 0.6), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#00AFBB", "grey", "#bb0c00"), # to set the colours of our variable
+                       labels = c("Decreased", "No significant change", "Increased")) + # to set the labels in case we want to overwrite the categories from the dataframe (UP, DOWN, NO)
+  coord_cartesian(ylim = c(0, 50), xlim = c(-3, 3)) + # since some genes can have minuslog10padj of inf, we set these limits
+  labs(color = 'Proteoform Change', #legend_title
+       x = expression("log"[2]*"FC"), y = expression("-log"[10]*"p-value")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) + # to customise the breaks in the x axis
+  ggtitle('Proteoforms changed on experiment1 treatment - mean normalization') + # Plot title
+  geom_text_repel(
+    size = 3, 
+    max.overlaps = Inf,
+    #nudge_x = 0.05, 
+    nudge_y = 0.15,
+    point.padding = unit(0.4, "lines"),  # adjust based on your specific plot's scale
+    box.padding = unit(0.4, "lines")
+  ) # To show all labels
+
+# CUMULATIVE
+experiment1_median_norm_volcano_plot <- ggplot(data = TMT_median_hit_grouped_ttest_df, aes(x = fc_median, y = -log10(median_p_value), col = change, label = label_cond)) +
+  geom_vline(xintercept = c(-0.6, 0.6), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#00AFBB", "grey", "#bb0c00"), # to set the colours of our variable
+                       labels = c("Decreased", "No significant change", "Increased")) + # to set the labels in case we want to overwrite the categories from the dataframe (UP, DOWN, NO)
+  coord_cartesian(ylim = c(0, 50), xlim = c(-3, 3)) + # since some genes can have minuslog10padj of inf, we set these limits
+  labs(color = 'Proteoform Change', #legend_title
+       x = expression("log"[2]*"FC"), y = expression("-log"[10]*"p-value")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) + # to customise the breaks in the x axis
+  ggtitle('Proteoforms changed on experiment1 treatment - median normalization') + # Plot title
+  geom_text_repel(
+    size = 3, 
+    max.overlaps = Inf,
+    #nudge_x = 0.05, 
+    nudge_y = 0.15,
+    point.padding = unit(0.4, "lines"),  # adjust based on your specific plot's scale
+    box.padding = unit(0.4, "lines")
+  ) # To show all labels
+
+# Export RData version of t-test analysis
+setwd(directory)
+file_name <- paste0("experiment1_all_hits_cumulative_volcano_plot_", save_name_RData_suffix)
+save(experiment1_cumulative_norm_volcano_plot, file = file_name)
+file_name <- paste0("experiment1_all_hits_mean_volcano_plot_", save_name_RData_suffix)
+save(experiment1_mean_norm_volcano_plot, file = file_name)
+file_name <- paste0("experiment1_all_hits_median_volcano_plot_", save_name_RData_suffix)
+save(experiment1_median_norm_volcano_plot, file = file_name)
+```
+
+Printing tables for comparison
+
+```{r}
+proteoform_df <- assigned_fractional_intensity_hits %>%
+  group_by(all_mods) %>%
+  mutate( proteoform_intensity = sum(total_intensity)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate( fractional_intensity = proteoform_intensity / total_PSM_intensity) %>%
+  ungroup() %>%
+  distinct(all_mods, .keep_all = TRUE)
+
+column_order <- c("all_mods", "proteoform_intensity", "fractional_intensity")  
+  
+proteoform_df <- proteoform_df[, column_order]
+
+names(proteoform_df) <- c("all_mods", "proteoform_intensity", "percent_abundance")
+
+column_order <- c("all_mods", "cum_p_value", "fc_cum", "ctrl_percent", "var_percent")  
+cumulative_df <- proteoform_intensity_cumulative_df
+  
+cumulative_df <- cumulative_df[, column_order]
+    
+names(cumulative_df) <- c("all_mods", "cumulative_norm_p_value", "cumulative_log2-fold_change", "cumulative_ctrl_percent", "cumulative_var_percent")
+
+column_order <- c("all_mods", "mean_p_value", "fc_mean", "ctrl_percent", "var_percent")  
+
+mean_df <- proteoform_intensity_mean_df
+  
+mean_df <- mean_df[, column_order]
+    
+names(mean_df) <- c("all_mods", "mean_norm_p_value", "mean_log2-fold_change", "mean_ctrl_percent", "mean_var_percent")
+
+column_order <- c("all_mods", "median_p_value", "fc_median", "ctrl_percent", "var_percent")  
+
+median_df <- proteoform_intensity_median_df
+  
+median_df <- median_df[, column_order]
+    
+names(median_df) <- c("all_mods", "median_norm_p_value", "median_log2-fold_change", "median_ctrl_percent", "median_var_percent")
+
+proteoform_df <- proteoform_df %>%
+  left_join(cumulative_df, by = "all_mods") %>%
+  left_join(mean_df, by = "all_mods") %>%
+  left_join(median_df, by = "all_mods") %>%
+  mutate(all_mods = sub(" Cterm36srt", "", all_mods)) %>%
+  mutate(all_mods = sub("Cterm36srt", "unmodified", all_mods))
+
+setwd(directory)
+file_name <- paste0("experiment1_proteoform_df_", save_name_csv_suffix)
+write_excel_csv(proteoform_df, file = file_name)
+
+file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
+save(proteoform_df, file = file_name)
+```
+
+
+
