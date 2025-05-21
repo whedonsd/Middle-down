@@ -1127,14 +1127,14 @@ Step 3: use ion identities to determine whether fragments fall between nearest_b
 
 #First, we need a function that assembles a_b_c_ions_df and y_z_ions_df for each scan_number and PID combination from matches_data_df_w_mods_updated. This will involve filtering the dataframe for each ion type and converting y and z ion positions.
 assemble_ions_df <- function(df, target_scan_number, target_PID) {
-  a_b_c_ions_df <- dplyr::filter(df, 
-                               scan_number == as.numeric(target_scan_number), 
-                               PID == as.numeric(target_PID), 
+  a_b_c_ions_df <- dplyr::filter(df,
+                               scan_number == as.numeric(target_scan_number),
+                               PID == as.numeric(target_PID),
                                ion_type %in% c("a", "b", "c", "a_nl_O", "b_nl_O", "c_nl_O", "a_nl_N", "b_nl_N", "c_nl_N", "a_nl_Kme3", "b_nl_Kme3", "c_nl_Kme3", "a_nl_pST", "b_nl_pST", "c_nl_pST", "a_nl_Ksu", "b_nl_Ksu", "c_nl_Ksu"))
-    
-  y_z_ions_df <- a_b_c_ions_df <- dplyr::filter(df, 
-                               scan_number == as.numeric(target_scan_number), 
-                               PID == as.numeric(target_PID), 
+
+  y_z_ions_df <- dplyr::filter(df,
+                               scan_number == as.numeric(target_scan_number),
+                               PID == as.numeric(target_PID),
                                ion_type %in% c("y", "z", "y_nl_O", "z_nl_O", "y_nl_N", "z_nl_N", "y_nl_Kme3", "z_nl_Kme3", "y_nl_pST", "z_nl_pST", "y_nl_Ksu", "z_nl_Ksu")) %>%
     mutate(ion_position = nchar(peptide) - ion_position + 1)
 
