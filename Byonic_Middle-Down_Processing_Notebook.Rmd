@@ -14,7 +14,7 @@ setwd(directory)
 # TMT 6-plex ETD ion masses
 TMT_ETD_mz_values <- c(114.127725, 115.124760, 116.134433, 117.131468, 118.141141, 119.138176)
 
-# TMT 6-plex ETD ion masses
+# TMT 6-plex HCD ion masses
 TMT_HCD_mz_values <- c(126.127726, 127.124761, 128.134436, 129.131471, 130.141145, 131.138180)
 
 # TMT 6-plex isotopic corrections
