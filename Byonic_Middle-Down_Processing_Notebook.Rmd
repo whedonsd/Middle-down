@@ -1140,7 +1140,7 @@ assemble_ions_df <- function(df, target_scan_number, target_PID) {
 
   # Debugging print statements
   print(paste("ABC Ions DF Rows:", nrow(a_b_c_ions_df)))
-  print(paste("YZ IonscDF Rows:", nrow(y_z_ions_df)))
+  print(paste("YZ Ions DF Rows:", nrow(y_z_ions_df)))
   
   return(list(a_b_c_ions_df = a_b_c_ions_df, y_z_ions_df = y_z_ions_df))
 }
