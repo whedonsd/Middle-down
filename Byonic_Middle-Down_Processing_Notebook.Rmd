@@ -762,39 +762,6 @@ combined_results <- combined_results %>%
 Confirm whether a hit has disambiguating ions between all modification sites
 
 ```{r}
-# Simplified check_columns function
-disambiguate <- function(data, col_range_start, col_range_end) {
-  # Assuming data is already filtered for a specific scan_number and PID
-  
-  # Dynamically select the range of columns if col_range_start and col_range_end are column names
-  columns_to_check <- select(data, dplyr::all_of(col_range_start):dplyr::all_of(col_range_end))
-  
-  # Apply the check across the specified columns
-  columns_check_result <- purrr::map_lgl(columns_to_check, function(column) {
-    # Check if the column contains at least one "1"
-    has_one <- any(column == 1, na.rm = TRUE)
-    # If the column has at least one "1", it satisfies the condition
-    if (has_one) {
-      return(TRUE)
-    } else {
-      # If there are no "1"s, check if there's at least one NA (which also satisfies the condition)
-      return(all(is.na(column)))
-    }
-  })
-  
-  # Return TRUE if all columns meet the criteria
-  return(all(columns_check_result))
-}
-
-# Function to iterate over all scan_number and PID combinations and apply check_columns
-disambiguate_all <- function(data, col_range_start, col_range_end) {
-  results <- data %>%
-    group_by(scan_number, PID) %>%
-    summarise(all_true = disambiguate(cur_data(), col_range_start, col_range_end), .groups = 'drop')
-  
-  return(results)
-}
-
 # Step 1: Group your dataframe by scan_number
 grouped_df_list <- combined_results %>% 
   group_by(scan_number) %>%
@@ -2817,6 +2784,7 @@ write_excel_csv(proteoform_df, file = file_name)
 file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
 save(proteoform_df, file = file_name)
 ```
+
 
 
 
