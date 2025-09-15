@@ -120,44 +120,6 @@ Byonic_df <- Byonic_df %>%
   )) %>%
   mutate(modifications = str_replace_all(modifications, "Sortag2", "37"))
 
-# Define a function to parse position and mass values and create a dataframe
-parse_position_mass <- function(mod_str) {
-  mod_list <- str_split(mod_str, ";\\s*")[[1]]
-  mods_df <- map_df(mod_list, ~ {
-    if (.x != "") {
-      # Extract only the numeric part of the position
-      position <- as.integer(str_extract(.x, "\\d+"))
-      variable <- as.numeric(str_extract(.x, "(?<=/)[\\d\\.]+"))
-      tibble(position = position, variable = variable)
-    } else {
-      tibble(position = NA_integer_, variable = NA_real_)
-    }
-  })
-  
-  # Check if both positions 36 and 37 exist in the dataframe
-  if(all(c(36, 37) %in% mods_df$position)) {
-    # Calculate the sum of the masses for positions 36 and 37
-    sum_mass <- sum(mods_df$variable[mods_df$position %in% c(36, 37)], na.rm = TRUE)
-    
-    # Remove the original rows for position 37
-    mods_df <- mods_df[!mods_df$position %in% c(37), ]
-    
-    # Update the mass at position 36 to the new sum
-    if(any(mods_df$position == 36)) {
-      mods_df <- mods_df %>%
-        mutate(variable = if_else(position == 36, sum_mass, variable))
-      # Change the position of this updated mass from 36 to 37
-      mods_df <- mods_df %>%
-        mutate(position = if_else(position == 36, 36, position))
-    } else {
-      # If position 36 doesn't exist, just add a new row for position 37
-      mods_df <- bind_rows(mods_df, tibble(position = 36, variable = sum_mass))
-    }
-  }
-  
-  return(mods_df)
-}
-
 Byonic_df <- Byonic_df %>%
   rowwise() %>%
   mutate(modifications_df = list(parse_position_mass(modifications))) %>%
@@ -208,28 +170,11 @@ experiment2_scan_list <- as.list(c(experiment2_df$Scan.Number.s...Posit.))
 
 experiment3_scan_list <- as.list(c(experiment3_df$Scan.Number.s...Posit.))
 
-# Create list of mz intensity values
-process_list <- function(input_list) {
-  # Initialize list to store values
-  empty_list <- list()
+experiment1_list <- process_Byonic_list(experiment1_list)
 
-  # Iterate through Scan_list using retrieved scan_number values
-  for(i in seq_along(input_list)) {
-    scan_number <- as.character(input_list[[i]]$scan_number)
-    PID <- as.character(input_list[[i]]$PID)
-    scan_data <- input_list[[i]]
-    empty_list[[as.character(scan_number)]][[PID]] <- scan_data
-  }
-  
-  # Explicitly return the list
-  return(empty_list)
-}
+experiment2_list <- process_Byonic_list(experiment2_list)
 
-experiment1_list <- process_list(experiment1_list)
-
-experiment2_list <- process_list(experiment2_list)
-
-experiment3_list <- process_list(experiment3_list)
+experiment3_list <- process_Byonic_list(experiment3_list)
 
 ```
 
@@ -238,34 +183,17 @@ Read in mass spec data
 ```{r}
 setwd(directory)
 
-# Function to process scans from thermo .RAW data converted to mzML.gz
-# Create list of mz intensity values
-process_scans <- function(Scan_list, mz) {
-  # Initialize list to store values
-  mz_list <- list()
-
-  # Iterate through Scan_list using retrieved scan_number values
-  for(i in seq_along(Scan_list)) {
-    scan_number <- as.integer(Scan_list[[i]])
-    scan_data <- as.data.frame(peaks(mz, scan = scan_number))
-    mz_list[[as.character(scan_number)]] <- scan_data
-  }
-  
-  # Explicitly return the list
-  return(mz_list)
-}
-
 experiment1_mz <- openMSfile("C:/path_to_your_data/file1.mzML.gz")
 
-experiment1_mz_list <- process_scans(experiment1_scan_list, experiment1_mz)
+experiment1_mz_list <- process_scans_from_mzMLgz(experiment1_scan_list, experiment1_mz)
 
 experiment2_mz <- openMSfile("C:/path_to_your_data/file2.mzML.gz")
 
-experiment2_mz_list <- process_scans(experiment2_scan_list, experiment2_mz)
+experiment2_mz_list <- process_scans_from_mzMLgz(experiment2_scan_list, experiment2_mz)
 
 experiment3_mz <- openMSfile("C:/path_to_your_data/file3.mzML.gz")
 
-experiment3_mz_list <- process_scans(experiment3_scan_list, experiment3_mz)
+experiment3_mz_list <- process_scans_from_mzMLgz(experiment3_scan_list, experiment3_mz)
 ```
 
 Find ion matches
@@ -834,39 +762,6 @@ combined_results <- combined_results %>%
 Confirm whether a hit has disambiguating ions between all modification sites
 
 ```{r}
-# Simplified check_columns function
-disambiguate <- function(data, col_range_start, col_range_end) {
-  # Assuming data is already filtered for a specific scan_number and PID
-  
-  # Dynamically select the range of columns if col_range_start and col_range_end are column names
-  columns_to_check <- select(data, dplyr::all_of(col_range_start):dplyr::all_of(col_range_end))
-  
-  # Apply the check across the specified columns
-  columns_check_result <- purrr::map_lgl(columns_to_check, function(column) {
-    # Check if the column contains at least one "1"
-    has_one <- any(column == 1, na.rm = TRUE)
-    # If the column has at least one "1", it satisfies the condition
-    if (has_one) {
-      return(TRUE)
-    } else {
-      # If there are no "1"s, check if there's at least one NA (which also satisfies the condition)
-      return(all(is.na(column)))
-    }
-  })
-  
-  # Return TRUE if all columns meet the criteria
-  return(all(columns_check_result))
-}
-
-# Function to iterate over all scan_number and PID combinations and apply check_columns
-disambiguate_all <- function(data, col_range_start, col_range_end) {
-  results <- data %>%
-    group_by(scan_number, PID) %>%
-    summarise(all_true = disambiguate(cur_data(), col_range_start, col_range_end), .groups = 'drop')
-  
-  return(results)
-}
-
 # Step 1: Group your dataframe by scan_number
 grouped_df_list <- combined_results %>% 
   group_by(scan_number) %>%
@@ -2889,6 +2784,8 @@ write_excel_csv(proteoform_df, file = file_name)
 file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
 save(proteoform_df, file = file_name)
 ```
+
+
 
 
 
