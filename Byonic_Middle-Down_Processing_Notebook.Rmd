@@ -54,22 +54,7 @@ stored_parameters <- list(
 #  unambiguous = unambiguous
 )
 
-save_name <- function(stored_parameters) {
-  # Generate a file name based on the parameters
-  file_name <- paste0(
-    "Byonic_",
-    "max_mods_", stored_parameters$max_mods, "_",
-    "PEP.2D_", stored_parameters$PEP, "_",
-#    "FDR.2D_", stored_parameters$FDR, "_",
-    "min_delta_mod_", stored_parameters$min_delta_mod, "_",
-    "ppm_tolerance_", stored_parameters$ppm_tolerance, "_",
-    stored_parameters$aa_tag, "-tag"
-#    "min_int_threshold_", stored_parameters$min_int_threshold, "_",
-#    "unambiguous_", stored_parameters$unambiguous
-  )
-  return(file_name)
-}
-
+# helper functions now provided by middleDownR
 save_name_suffix <- save_name(stored_parameters)
 save_name_RData_suffix <- paste0(save_name(stored_parameters), ".RData")
 save_name_csv_suffix <- paste0(save_name(stored_parameters), ".csv")
@@ -266,73 +251,7 @@ if (total_chunk_length != original_length) {
 }
 
 # 2. Define a Function for Processing Chunks
-process_chunk <- function(chunk) {
-  # Initialize an empty dataframe for this chunk
-  matches_list_df_chunk <- data.frame(
-    scan_number = integer(),
-    PID = integer(),
-    ion_type = character(),
-    ion_position = integer(),
-    ion_charge = integer(),
-    mz = numeric(),
-    intensity = numeric(),
-    peptide = character(),
-    modifications = character(),
-    stringsAsFactors = FALSE
-  )
-
-  # Initialize an empty list to collect rows for this chunk
-  rows_to_add <- list()
-  
-  # Loop through each scan_number in the chunk
-  for (scan_number in names(chunk)) {
-    for (PID in names(chunk[[scan_number]])) {
-      hit_data <- chunk[[scan_number]][[PID]]
-      
-      # Extract peptide_sequence and modifications for this scan_number and PID
-      peptide_sequence <- hit_data[["peptide_sequence"]]
-      modifications <- hit_data[["modifications"]]
-    
-      # Ensure ion_keys exclude metadata keys
-      ion_keys = setdiff(names(hit_data), c("peptide_sequence", "modifications"))
-  
-      for (ion_key in ion_keys) { # ion_keys defined by setdiff() excluding metadata keys
-        ion_data <- hit_data[[ion_key]]
-  
-       # Extract ion_type and ion_position from ion_key
-        ion_type <- sub("^(.*?)_ions.*$", "\\1", ion_key) # This might need adjustment
-        parts <- strsplit(ion_key, "_pos_")[[1]]
-        ion_position <- as.integer(strsplit(parts[2], "_")[[1]][1])
-  
-        # Extract ion_charge from ion_key
-        charge_pattern <- "_charge[ .]?([0-9]+)_"
-        if(length(gregexpr(charge_pattern, ion_key)[[1]]) > 0) { # Ensure a match is found
-          matches <- regmatches(ion_key, gregexpr(charge_pattern, ion_key))
-          ion_charge <- as.integer(sub(charge_pattern, "\\1", matches[[1]]))
-        } else {
-          ion_charge <- NA # Assign NA if no charge information is extracted
-        }
-      
-        # Collect the new row to add it to the list
-        rows_to_add[[length(rows_to_add) + 1]] <- data.frame(
-          scan_number = as.integer(scan_number),
-          PID = as.integer(PID),
-          ion_type = ion_type,
-          ion_position = ion_position,
-          ion_charge = ion_charge,
-          mz = ion_data$mz,
-          intensity = ion_data$intensity,
-          peptide = peptide_sequence,
-          modifications = modifications,
-          stringsAsFactors = FALSE
-        )
-      }
-    }
-  }
-  
-  # After collecting all rows, combine them into a single dataframe
-  matches_list_df_chunk <- do.call(rbind, rows_to_add)
-}
+# provided by middleDownR::process_chunk
 
 # 3. Execute in Parallel
 cl <- makeCluster(numCores)
@@ -366,23 +285,7 @@ Step 1: split up modifications data
 # Assuming matches_data_df_w_mods already exists and has a 'modifications' column
 
 # Define fill_modifications_direct function to work directly on the dataframe
-fill_modifications_direct <- function(df, max_mods) {
-  for (row in 1:nrow(df)) {
-    modification_str <- df$modifications[row]
-    if (is.na(modification_str)) next # Skip if NA
-    
-    mod_parts <- strsplit(modification_str, ";")[[1]]
-    mods <- lapply(mod_parts, function(x) strsplit(x, ":")[[1]])
-    
-    for (i in 1:length(mods)) {
-      if (i > max_mods) break # Do not exceed the max number of modifications
-      mod_pair <- mods[[i]]
-      df[row, paste0("mod_pos_", i)] <- as.numeric(mod_pair[1])
-      df[row, paste0("mod_mass_", i)] <- as.numeric(mod_pair[2])
-    }
-  }
-  return(df)
-}
+# provided by middleDownR::fill_modifications_direct
 
 # Parallelization
 
@@ -397,8 +300,9 @@ cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Step 3: Export necessary objects and functions to each cluster node
-clusterExport(cl, varlist = c("fill_modifications_direct", "max_mods"))
+clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -414,15 +318,7 @@ fill_mods_results <- parLapply(cl, grouped_df_list, function(group) {
 # The method to combine results depends on the structure of your output
 matches_data_df_w_mods <- bind_rows(fill_mods_results)
 
-add_column_if_not_exists <- function(df, column_name) {
-  # Check if the column does not exist
-  if (!column_name %in% names(df)) {
-    # Create the column with NA values
-    df[[column_name]] <- NA
-  }
-  # Return the modified dataframe
-  return(df)
-}
+# provided by middleDownR::add_column_if_not_exists
 
 matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_pos_6") 
 matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_mass_6")
@@ -437,57 +333,6 @@ Step 2: find nearest_before and nearest_after by modification type
 ```{r}
 # HELPER functions
 
-# Modified find_nearest_KR function to operate on dataframe columns
-find_nearest_KR_df <- function(peptide, mod_position) {
-  # Initialize vectors to store results
-  nearest_before <- numeric(length(peptide))
-  nearest_after <- numeric(length(peptide))
-  
-  for (i in seq_along(peptide)) {
-    aa_sequence <- unlist(strsplit(peptide[i], ""))
-    kr_positions <- which(aa_sequence %in% c("K", "R"))
-    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
-    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
-  }
-  
-  # Return a dataframe with the calculated positions
-  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
-}
-
-# Modified find_nearest_K function to operate on dataframe columns
-find_nearest_K_df <- function(peptide, mod_position) {
-  # Initialize vectors to store results
-  nearest_before <- numeric(length(peptide))
-  nearest_after <- numeric(length(peptide))
-  
-  for (i in seq_along(peptide)) {
-    aa_sequence <- unlist(strsplit(peptide[i], ""))
-    kr_positions <- which(aa_sequence %in% c("K"))
-    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
-    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
-  }
-  
-  # Return a dataframe with the calculated positions
-  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
-}
-
-# Modified find_nearest_ST function to operate on dataframe columns
-find_nearest_ST_df <- function(peptide, mod_position) {
-  # Initialize vectors to store results
-  nearest_before <- numeric(length(peptide))
-  nearest_after <- numeric(length(peptide))
-  
-  for (i in seq_along(peptide)) {
-    aa_sequence <- unlist(strsplit(peptide[i], ""))
-    kr_positions <- which(aa_sequence %in% c("S", "T"))
-    nearest_before[i] <- ifelse(any(kr_positions < mod_position[i]), max(kr_positions[kr_positions < mod_position[i]]), NA)
-    nearest_after[i] <- ifelse(any(kr_positions > mod_position[i]), min(kr_positions[kr_positions > mod_position[i]]), NA)
-  }
-  
-  # Return a dataframe with the calculated positions
-  return(data.frame(nearest_before = nearest_before, nearest_after = nearest_after))
-}
-
 # Assuming max_mods is already defined as the maximum number of modifications you expect per peptide
 # For each modification, you want to add nearest_before_mod_n, nearest_after_mod_n, and nearest_fn
 
@@ -501,57 +346,7 @@ for(i in 1:max_mods) {
 # Assuming you have a dataframe `matches_data_df_w_mods` with peptides, modification positions, and masses
 
 # Update the function to directly modify the dataframe
-apply_nearest_function_directly <- function(df) {
-  # Iterate over each row of the dataframe
-  for (i in 1:nrow(df)) {
-    # Extract current row's peptide, mod positions, and mod masses
-    peptide <- df$peptide[i]
-    mod_positions <- sapply(1:max_mods, function(n) df[[paste0("mod_pos_", n)]][i])
-    mod_masses <- sapply(1:max_mods, function(n) df[[paste0("mod_mass_", n)]][i])
-
-    # Initialize containers for the results
-    nearest_befores <- rep(NA, max_mods)
-    nearest_afters <- rep(NA, max_mods)
-    nearest_fns <- rep(NA, max_mods)
-    
-    # Process each modification
-    for (j in 1:max_mods) {
-      mod_position <- mod_positions[j]
-      mod_mass <- mod_masses[j]
-      # Skip processing if mod_position or mod_mass is NA
-      if (is.na(mod_position) || is.na(mod_mass)) next
-      
-      # Decide which nearest function to use based on mod_mass
-      if (mod_mass %in% c(14.015650, 28.031300)) {
-        result <- find_nearest_KR_df(peptide, mod_position)
-        nearest_fn <- "KR" # updated to remove trimethylation from KR check
-      } else if (mod_mass %in% c(79.966331)) {
-        result <- find_nearest_ST_df(peptide, mod_position)
-        nearest_fn <- "ST"
-      } else if (mod_mass %in% c(42.010565, 42.046950, 56.026215, 72.02113, 86.036779, 100.01604)) {
-        result <- find_nearest_K_df(peptide, mod_position)
-        nearest_fn <- "K" # updated to add trimethylation given specificity for K
-      } else {
-        result <- list(nearest_before = NA, nearest_after = NA)
-        nearest_fn <- "NA"
-      }
-      
-      # Store the results
-      nearest_befores[j] <- result$nearest_before
-      nearest_afters[j] <- result$nearest_after
-      nearest_fns[j] <- nearest_fn
-    }
-
-    # Assign the results back to the dataframe
-    for (j in 1:max_mods) {
-      df[[paste0("nearest_before_mod_", j)]][i] <- nearest_befores[j]
-      df[[paste0("nearest_after_mod_", j)]][i] <- nearest_afters[j]
-      df[[paste0("nearest_fn_mod_", j)]][i] <- nearest_fns[j]
-    }
-  }
-  
-  return(df)
-}
+# provided by middleDownR::apply_nearest_function_directly
 
 # Apply the function to your dataframe
 # Parallelization
@@ -572,8 +367,9 @@ cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Step 3: Export necessary objects and functions to each cluster node
-clusterExport(cl, varlist = c("find_nearest_KR_df", "find_nearest_K_df", "find_nearest_ST_df", "max_mods", "apply_nearest_function_directly"))
+clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -582,7 +378,7 @@ clusterEvalQ(cl, {
 
 # Execute the task in parallel
 find_nearest_results <- parLapply(cl, grouped_df_list, function(group) {
-  apply_nearest_function_directly(group)
+  apply_nearest_function_directly(group, max_mods)
 })
 
 # Combine the results from all cores
@@ -597,50 +393,12 @@ Step 3: use ion identities to determine whether fragments fall between nearest_b
 # Helper function
 
 #First, we need a function that assembles a_b_c_ions_df and y_z_ions_df for each scan_number and PID combination from matches_data_df_w_mods_updated. This will involve filtering the dataframe for each ion type and converting y and z ion positions.
-assemble_ions_df <- function(df, target_scan_number, target_PID) {
-  a_b_c_ions_df <- dplyr::filter(df,
-                               scan_number == as.numeric(target_scan_number),
-                               PID == as.numeric(target_PID),
-                               ion_type %in% c("a", "b", "c", "a_nl_O", "b_nl_O", "c_nl_O", "a_nl_N", "b_nl_N", "c_nl_N", "a_nl_Kme3", "b_nl_Kme3", "c_nl_Kme3", "a_nl_pST", "b_nl_pST", "c_nl_pST", "a_nl_Ksu", "b_nl_Ksu", "c_nl_Ksu"))
-
-  y_z_ions_df <- dplyr::filter(df,
-                               scan_number == as.numeric(target_scan_number),
-                               PID == as.numeric(target_PID),
-                               ion_type %in% c("y", "z", "y_nl_O", "z_nl_O", "y_nl_N", "z_nl_N", "y_nl_Kme3", "z_nl_Kme3", "y_nl_pST", "z_nl_pST", "y_nl_Ksu", "z_nl_Ksu")) %>%
-    mutate(ion_position = nchar(peptide) - ion_position + 1)
-
-  # Debugging print statements
-  print(paste("ABC Ions DF Rows:", nrow(a_b_c_ions_df)))
-  print(paste("YZ Ions DF Rows:", nrow(y_z_ions_df)))
-  
-  return(list(a_b_c_ions_df = a_b_c_ions_df, y_z_ions_df = y_z_ions_df))
-}
+# provided by middleDownR::assemble_ions_df
 
 # ions_result <- assemble_ions_df(matches_data_df_w_mods_updated, "983", "1")
 
-check_unambiguity_before <- function(nearest_before, mod_position, a_b_c_ions_df, y_z_ions_df) {
-  # If nearest_before is NA, return unambiguous
-  if (is.na(nearest_before)) return(TRUE)
-
-  abc_unambiguous <- any(a_b_c_ions_df$ion_position >= nearest_before & a_b_c_ions_df$ion_position < mod_position)
-  yz_unambiguous <- any(y_z_ions_df$ion_position > nearest_before & y_z_ions_df$ion_position <= mod_position)
-  return(abc_unambiguous || yz_unambiguous)
-  # TRUE || NA will return TRUE, because if one operand is TRUE, the overall expression is TRUE regardless of the other operand
-  # TRUE || FALSE will return TRUE, because if one operand is TRUE, the overall expression is TRUE regardless of the other operand
-  # NA || TRUE will also return TRUE for the same reason
-  # FALSE || NA will return NA, because the outcome depends on the unknown (NA) operand
-  # NA || FALSE will return NA as well, for the same reason as above
-  # NA || NA will return NA, because there's no sufficient information to determine the result
-}
-
-check_unambiguity_after <- function(nearest_after, mod_position, a_b_c_ions_df, y_z_ions_df) {
-  # If nearest_after is NA, return unambiguous
-  if (is.na(nearest_after)) return(TRUE)
-
-  abc_unambiguous <- any(a_b_c_ions_df$ion_position < nearest_after & a_b_c_ions_df$ion_position >= mod_position)
-  yz_unambiguous <- any(y_z_ions_df$ion_position <= nearest_after & y_z_ions_df$ion_position > mod_position)
-  return(abc_unambiguous || yz_unambiguous)
-}
+# provided by middleDownR::check_unambiguity_before
+# provided by middleDownR::check_unambiguity_after
 
 # Add the required columns for ambiguity checks
 matches_data_df_w_mods_updated <- matches_data_df_w_mods_updated %>%
@@ -652,59 +410,7 @@ matches_data_df_w_mods_updated <- matches_data_df_w_mods_updated %>%
                 .names = "{.col}_{.fn}"))
 
 # Working function to apply ambiguity checks for each modification in a row
-  apply_ambiguity_checks <- function(df, max_mods) {
-  # Iterate through each mod_pos_ column
-  for (i in 1:max_mods) {
-    mod_pos_col <- paste0("mod_pos_", i)
-    nearest_before_col <- paste0("nearest_before_mod_", i)
-    nearest_after_col <- paste0("nearest_after_mod_", i)
-    abc_before_unambiguous_col <- paste0("mod_pos_", i, "_abc_before_unambiguous")
-    yz_before_unambiguous_col <- paste0("mod_pos_", i, "_yz_before_unambiguous")
-    abc_after_unambiguous_col <- paste0("mod_pos_", i, "_abc_after_unambiguous")
-    yz_after_unambiguous_col <- paste0("mod_pos_", i, "_yz_after_unambiguous")
-    
-    # Dynamically creating column names for assignment
-    df <- df %>%
-      rowwise() %>%
-      mutate(
-        !!abc_before_unambiguous_col := if_else(
-          !is.na(.data[[mod_pos_col]]),
-          # Assuming assemble_ions_df and check_unambiguity_before return a single value or NA_real_
-          {
-            ions <- assemble_ions_df(cur_data(), scan_number, PID)
-            check_unambiguity_before(.data[[nearest_before_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
-          },
-          NA_real_
-        ),
-        !!yz_before_unambiguous_col := if_else(
-          !is.na(.data[[mod_pos_col]]),
-          {
-            ions <- assemble_ions_df(cur_data(), scan_number, PID)
-            check_unambiguity_before(.data[[nearest_before_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
-          },
-          NA_real_
-        ),
-        !!abc_after_unambiguous_col := if_else(
-          !is.na(.data[[mod_pos_col]]),
-          {
-            ions <- assemble_ions_df(cur_data(), scan_number, PID)
-            check_unambiguity_after(.data[[nearest_after_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
-          },
-          NA_real_
-        ),
-        !!yz_after_unambiguous_col := if_else(
-          !is.na(.data[[mod_pos_col]]),
-          {
-            ions <- assemble_ions_df(cur_data(), scan_number, PID)
-            check_unambiguity_after(.data[[nearest_after_col]], .data[[mod_pos_col]], ions$a_b_c_ions_df, ions$y_z_ions_df)
-          },
-          NA_real_
-        )
-      ) %>%
-      ungroup()
-  }
-  return(df)
-}
+# apply_ambiguity_checks provided by middleDownR::apply_ambiguity_checks
 
 
 # Make sure to pass the actual number of max_mods you have in your data
@@ -738,8 +444,9 @@ cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Step 3: Export necessary objects and functions to each cluster node
-clusterExport(cl, varlist = c("apply_ambiguity_checks", "max_mods", "assemble_ions_df", "check_unambiguity_before", "check_unambiguity_after"))
+clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -773,8 +480,9 @@ cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Step 3: Export necessary objects and functions to each cluster node
-clusterExport(cl, varlist = c("disambiguate", "disambiguate_all"))
+clusterExport(cl, varlist = character(0))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -808,55 +516,7 @@ disambiguated_filenames <- paste0()
 Functions for extracting ion information from combined_results
 
 ```{r}
-# Function to extract SHARED intensities from a given sublist
-extract_intensities_from_sublist <- function(sublist, ions_list) {
-  # Match ion_type_position with ions_list and extract intensity
-  matched_intensities <- sublist %>%
-    filter(ion_type_position_charge %in% ions_list) %>%
-    pull(intensity)
-  return(matched_intensities)
-}
-
-# Function to find the correct sublist based on scan_number and PID and extract intensities
-extract_intensities <- function(scan_number, PID, ions_list, grouped_list) {
-  # Find the sublist that matches scan_number and PID
-  sublist <- grouped_list %>%
-    purrr::keep(~ all(c(.x$scan_number == scan_number, .x$PID == PID))) %>%
-    # Assuming there is only one match, otherwise you would need to handle multiple matches
-    purrr::pluck(1)
-  
-  # If a matching sublist is found, extract intensities, else return numeric(0)
-  if (!is.null(sublist) && nrow(sublist) > 0) {
-    return(extract_intensities_from_sublist(sublist, ions_list))
-  } else {
-    return(numeric(0))
-  }
-}
-
-# Function to extract shared ions from a given sublist
-extract_ion_identities_from_sublist <- function(sublist, ions_list) {
-  # Match ion_type_position with ions_list and extract intensity
-  matched_identities <- sublist %>%
-    filter(ion_type_position_charge %in% ions_list) %>%
-    pull(ion_type_position_charge)
-  return(matched_identities)
-}
-
-# Function to find the correct sublist based on scan_number and PID and extract intensities
-extract_ordered_ion_lists <- function(scan_number, PID, ions_list, grouped_list) {
-  # Find the sublist that matches scan_number and PID
-  sublist <- grouped_list %>%
-    purrr::keep(~ all(c(.x$scan_number == scan_number, .x$PID == PID))) %>%
-    # Assuming there is only one match, otherwise you would need to handle multiple matches
-    purrr::pluck(1)
-  
-  # If a matching sublist is found, extract intensities, else return numeric(0)
-  if (!is.null(sublist) && nrow(sublist) > 0) {
-    return(extract_ion_identities_from_sublist(sublist, ions_list))
-  } else {
-    return(numeric(0))
-  }
-}
+# helper functions now provided by middleDownR
 ```
 
 Re-capturing ion lists for disambiguated hits
@@ -1207,47 +867,7 @@ Helper functions for processing scans with multiple hits
 # Join hit dataframes
 # When a hit dataframe is missing one ion type or match type in row one the column class gets lost
 # This checks whether the class is character, and corrects it if not
-conditional_merge_hit_df <- function(appended_df, main_df) {
-  if (nrow(appended_df) > 0) {
-    # Check and convert column types for appended_df
-    if (class(appended_df$a_ions_shared) != "character") {
-      appended_df$a_ions_shared <- as.character(appended_df$a_ions_shared)
-    }
-    if (class(appended_df$b_ions_shared) != "character") {
-      appended_df$b_ions_shared <- as.character(appended_df$b_ions_shared)
-    }
-    if (class(appended_df$y_ions_shared) != "character") {
-      appended_df$y_ions_shared <- as.character(appended_df$y_ions_shared)
-    }
-    if (class(appended_df$c_ions_shared) != "character") {
-      appended_df$c_ions_shared <- as.character(appended_df$c_ions_shared)
-    }
-    if (class(appended_df$z_ions_shared) != "character") {
-      appended_df$z_ions_shared <- as.character(appended_df$z_ions_shared)
-    }
-    
-    # Check and convert column types for main_df
-    if (class(main_df$a_ions_shared) != "character") {
-      main_df$a_ions_shared <- as.character(main_df$a_ions_shared)
-    }
-    if (class(main_df$b_ions_shared) != "character") {
-      main_df$b_ions_shared <- as.character(main_df$b_ions_shared)
-    }
-    if (class(main_df$y_ions_shared) != "character") {
-      main_df$y_ions_shared <- as.character(main_df$y_ions_shared)
-    }
-    if (class(main_df$c_ions_shared) != "character") {
-      main_df$c_ions_shared <- as.character(main_df$c_ions_shared)
-    }
-    if (class(main_df$z_ions_shared) != "character") {
-      main_df$z_ions_shared <- as.character(main_df$z_ions_shared)
-    }
-    
-    # Merge the data frames
-    main_df <- main_df %>%
-      bind_rows(appended_df)
-  }
-}
+# provided by middleDownR::conditional_merge_hit_df
 ```
 
 Processing three hit scans to attribute fractional intensity
@@ -1290,8 +910,9 @@ cl <- makeCluster(no_cores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Export necessary objects and functions
-clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -1321,8 +942,9 @@ cl <- makeCluster(no_cores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Export necessary objects and functions
-clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -1555,8 +1177,9 @@ cl <- makeCluster(no_cores)
 on.exit(stopCluster(cl), add = TRUE)
 
 # Export necessary objects and functions
-clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
+clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -1577,27 +1200,7 @@ stopCluster(cl)
 # Combine the processed chunks back into a single dataframe
 three_hit_scans <- do.call(rbind, processed_chunks)
 
-# Define the custom function
-retrieve_value <- function(rank_order, average_12binary_ratio, average_13binary_ratio, average_ratio) {
-  # Initialize the value to retrieve
-  value_to_retrieve <- NA
-  
-  # Direct use of coalesce depends on rank_order
-  if (rank_order == 1) {
-    value_to_retrieve <- coalesce(average_13binary_ratio, average_12binary_ratio, average_ratio, 1)
-  } else if (rank_order == 2) {
-    # Adjust the order or selection of columns as needed for rank_order == 2
-    value_to_retrieve <- coalesce(average_12binary_ratio, average_ratio, 1)
-  } else if (rank_order == 3) {
-    # Adjust the order or selection of columns as needed for rank_order == 3
-    value_to_retrieve <- coalesce(average_13binary_ratio, average_ratio, 1)
-  } else {
-    # Default case or error handling
-    value_to_retrieve <- NA_real_
-  }
-  
-  return(value_to_retrieve)
-}
+# provided by middleDownR::retrieve_value
 
 # Apply the function row-wise on your dataframe
 three_hit_scans <- three_hit_scans %>%
@@ -1949,21 +1552,7 @@ site_df <- data.frame(
 )
 
 # Assuming the function checks a single value against the ref_df
-check_against_reference <- function(input_value, ref_df) {
-  if (is.na(input_value)) {
-    return("")  # Or return("") for an empty cell
-  } else {
-    matched_entry <- ref_df %>%
-      filter(num_value == input_value) %>%  # Ensure 'num_value' exactly matches the column name in 'ref_df'
-      pull(text_string)  # Assuming 'text_string' is the column you want to retrieve
-    
-    if (length(matched_entry) == 0) {
-      return("")
-    } else {
-      return(matched_entry)
-    }
-  }
-}
+# provided by middleDownR::check_against_reference
 
 file_name <- paste0("experiment1_all_hits_assigned_fractional_intensity_hits_", save_name_RData_suffix)
 save(assigned_fractional_intensity_hits, file = file_name)
@@ -2035,31 +1624,7 @@ assigned_fractional_intensity_backup <- assigned_fractional_intensity_hits
 assigned_fractional_intensity_hits <- assigned_fractional_intensity_backup
 
 # Function for extracting TMT ion intensities
-find_intensities_for_scan <- function(scan_number, mz, target_mz, ppm_tolerance) {
-  # Convert the scan number to an integer if necessary
-  scan_number_int <- as.integer(scan_number)
-  
-  # Retrieve the peaks data for the given scan number from the mz object
-  scan_data <- peaks(mz, scan = scan_number_int)
-  
-  # Proceed to find intensities within the tolerance for the target m/z values
-  intensities <- sapply(target_mz, function(mz) {
-    tolerance <- calculate_tolerance(mz, ppm_tolerance)
-    idx <- which(scan_data[, 1] >= mz - tolerance & scan_data[, 1] <= mz + tolerance)
-    
-    if (length(idx) > 0) {
-      # Calculate distances for all matches
-      distances <- abs(scan_data[idx, 1] - mz)
-      # Select the index with the smallest distance
-      closest_match_idx <- idx[which.min(distances)]
-      return(scan_data[closest_match_idx, 2])  # Returning the intensity of the closest match
-    } else {
-      return(NA)  # Return NA if no matches are found
-    }
-  })
-  
-  return(intensities)
-}
+# provided by middleDownR::find_intensities_for_scan
 
 mz <- experiment1_mz
 
@@ -2075,16 +1640,7 @@ assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
   )
 
 # Function to identify rows with => 5 TMT signals
-TMT_check <- function(data, col_range_start, col_range_end, TMT_count) {
-  # Dynamically select the range of columns
-  columns_to_check <- data %>% select(dplyr::all_of(col_range_start):dplyr::all_of(col_range_end))
-  
-  # Apply the check across the specified columns and count how many satisfy the condition
-  columns_check_result <- purrr::map_lgl(columns_to_check, ~any(.x > 0, na.rm = TRUE))
-  
-  # Return TRUE if at least 5 columns meet the criteria
-  sum(columns_check_result) >= TMT_count
-}
+# provided by middleDownR::TMT_check
 
 # Identifying rows with => 5 TMT signals
 assigned_fractional_intensity_hits <- assigned_fractional_intensity_hits %>%
