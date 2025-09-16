@@ -637,6 +637,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   # Export necessary objects and functions
   clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
+    library(middleDownR)
     library(dplyr)  # Assuming dplyr is used in your functions
     library(purrr)
     library(tidyr)
@@ -668,6 +669,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   # Export necessary objects and functions
   clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
+    library(middleDownR)
     library(dplyr)  # Assuming dplyr is used in your functions
     library(purrr)
     library(tidyr)
@@ -699,6 +701,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   # Export necessary objects and functions
   clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
+    library(middleDownR)
     library(dplyr)  # Assuming dplyr is used in your functions
     library(purrr)
     library(tidyr)
@@ -730,6 +733,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   # Export necessary objects and functions
   clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
+    library(middleDownR)
     library(dplyr)  # Assuming dplyr is used in your functions
     library(purrr)
     library(tidyr)
@@ -1469,6 +1473,7 @@ on.exit(stopCluster(cl), add = TRUE)
 # Export necessary objects and functions
 clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
+  library(middleDownR)
   library(dplyr)  # Assuming dplyr is used in your functions
   library(purrr)
   library(tidyr)
@@ -2340,6 +2345,7 @@ write_excel_csv(proteoform_df, file = file_name)
 file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
 save(proteoform_df, file = file_name)
 ```
+
 
 
 
