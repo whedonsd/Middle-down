@@ -303,7 +303,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -351,11 +351,6 @@ for(i in 1:max_mods) {
 # Apply the function to your dataframe
 # Parallelization
 
-library(parallel)
-library(dplyr)
-library(tidyr)
-library(stringr)
-
 # Step 1: Group your dataframe by scan_number
 grouped_df_list <- matches_data_df_w_mods %>% 
   group_by(scan_number) %>%
@@ -370,7 +365,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -420,17 +415,11 @@ matches_data_df_w_mods_updated <- matches_data_df_w_mods_updated %>%
 # matches_data_df_w_mods_updated <- apply_ambiguity_checks(matches_data_df_w_mods_updated)
 
 # write_excel_csv(matches_data_df_w_mods_updated, "matches_data_df_w_mods_updated_ambiguity_check1")
-
 ```
 
 Parallelization
 
 ```{r}
-library(parallel)
-library(dplyr)
-library(tidyr)
-library(stringr)
-
 detectCores()
 
 # Step 1: Group your dataframe by scan_number
@@ -447,7 +436,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("max_mods"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -483,7 +472,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = character(0))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -513,15 +502,10 @@ disambiguated_true <- disambiguated_results %>%
 disambiguated_filenames <- paste0()
 ```
 
-Functions for extracting ion information from combined_results
-
-```{r}
-# helper functions now provided by middleDownR
-```
-
 Re-capturing ion lists for disambiguated hits
 
 ```{r}
+# Helper functions now provided by middleDownR
 # Assuming combined_results is your original dataframe from which to extract ion information
 ion_info_df <- combined_results %>%
   group_by(scan_number, PID) %>%
@@ -638,7 +622,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
     library(middleDownR)
-    library(dplyr)  # Assuming dplyr is used in your functions
+    library(dplyr)
     library(purrr)
     library(tidyr)
     library(stringr)
@@ -670,7 +654,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
     library(middleDownR)
-    library(dplyr)  # Assuming dplyr is used in your functions
+    library(dplyr)
     library(purrr)
     library(tidyr)
     library(stringr)
@@ -702,7 +686,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
     library(middleDownR)
-    library(dplyr)  # Assuming dplyr is used in your functions
+    library(dplyr)
     library(purrr)
     library(tidyr)
     library(stringr)
@@ -734,7 +718,7 @@ PSM_hits_list <- split(PSM_hits, PSM_hits$scan_number)
   clusterExport(cl, varlist = c("extract_ion_identities_from_sublist", "extract_ordered_ion_lists", "grouped_ion_intensity_list"))
   clusterEvalQ(cl, {
     library(middleDownR)
-    library(dplyr)  # Assuming dplyr is used in your functions
+    library(dplyr)
     library(purrr)
     library(tidyr)
     library(stringr)
@@ -863,20 +847,14 @@ single_hit_scans <- PSM_hits %>%
   ungroup()
 ```
 
-Helper functions for processing scans with multiple hits
-
-```{r}
-# Helper functions
-
-# Join hit dataframes
-# When a hit dataframe is missing one ion type or match type in row one the column class gets lost
-# This checks whether the class is character, and corrects it if not
-# provided by middleDownR::conditional_merge_hit_df
-```
-
 Processing three hit scans to attribute fractional intensity
 
 ```{r}
+# Helper functions provided by middleDownR::conditional_merge_hit_df
+# Join hit dataframes
+# When a hit dataframe is missing one ion type or match type in row one the column class gets lost
+# This checks whether the class is character, and corrects it if not
+
 # First, create a nested dataframe grouped by scan_number
 nested_df <- three_hit_scans %>%
   group_by(scan_number) %>%
@@ -917,7 +895,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -949,7 +927,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -1184,7 +1162,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -1474,7 +1452,7 @@ on.exit(stopCluster(cl), add = TRUE)
 clusterExport(cl, varlist = c("extract_intensities_from_sublist", "extract_intensities", "grouped_ion_intensity_list"))
 clusterEvalQ(cl, {
   library(middleDownR)
-  library(dplyr)  # Assuming dplyr is used in your functions
+  library(dplyr)
   library(purrr)
   library(tidyr)
   library(stringr)
@@ -2345,6 +2323,7 @@ write_excel_csv(proteoform_df, file = file_name)
 file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
 save(proteoform_df, file = file_name)
 ```
+
 
 
 
