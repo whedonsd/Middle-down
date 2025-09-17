@@ -1,4 +1,8 @@
 directory: "C:/Users/your_file_path/"
+cpu_usage: default
+cpu_usage_defaults:
+  default: "detectCores() / 2"
+  high: "detectCores() - 2"
 TMT_ETD_mz_values: [114.127725, 115.124760, 116.134433, 117.131468, 118.141141, 119.138176]
 TMT_HCD_mz_values: [126.127726, 127.124761, 128.134436, 129.131471, 130.141145, 131.138180]
 TMT126: [0, 0, 1, 0.076, 0]
