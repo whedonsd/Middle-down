@@ -1,3 +1,9 @@
+#' Ambiguity resolution utilities
+#'
+#' Helpers that assemble ion evidence and determine whether each potential modification site is unambiguously supported.
+#' @keywords internal
+NULL
+
 #' Assemble ion data frames for a given scan/PID combination
 #'
 #' @param df Data frame containing ion observations.
@@ -129,4 +135,66 @@ apply_ambiguity_checks <- function(df, max_mods) {
   }
 
   df
+}
+
+#' Evaluate ambiguity columns for a grouped subset of data
+#'
+#' @param data Data frame containing ambiguity assessment columns.
+#' @param col_range_start Name of the first ambiguity column to inspect.
+#' @param col_range_end Name of the last ambiguity column to inspect.
+#'
+#' @return Logical value indicating whether all columns satisfy the ambiguity rule.
+#' @export
+disambiguate <- function(data, col_range_start, col_range_end) {
+  columns <- names(data)
+  start_idx <- match(col_range_start, columns)
+  end_idx <- match(col_range_end, columns)
+
+  if (is.na(start_idx) || is.na(end_idx)) {
+    stop("Specified columns were not found in the data frame.")
+  }
+
+  if (start_idx <= end_idx) {
+    indices <- start_idx:end_idx
+  } else {
+    indices <- end_idx:start_idx
+  }
+
+  columns_to_check <- data[, indices, drop = FALSE]
+  columns_check_result <- vapply(columns_to_check, function(column) {
+    has_one <- any(column == 1, na.rm = TRUE)
+    if (has_one) {
+      TRUE
+    } else {
+      all(is.na(column))
+    }
+  }, logical(1))
+
+  all(columns_check_result)
+}
+
+#' Iterate ambiguity checks across scan/PID combinations
+#'
+#' @param data Data frame containing ambiguity columns and identifiers.
+#' @param col_range_start Name of the first ambiguity column to evaluate.
+#' @param col_range_end Name of the last ambiguity column to evaluate.
+#'
+#' @return Data frame summarising ambiguity status per scan/PID.
+#' @export
+disambiguate_all <- function(data, col_range_start, col_range_end) {
+  if (nrow(data) == 0) {
+    return(data.frame(scan_number = numeric(0), PID = numeric(0), all_true = logical(0)))
+  }
+
+  unique_pairs <- unique(data[, c("scan_number", "PID"), drop = FALSE])
+
+  results <- lapply(seq_len(nrow(unique_pairs)), function(i) {
+    scan_value <- unique_pairs$scan_number[i]
+    pid_value <- unique_pairs$PID[i]
+    subset_df <- data[data$scan_number == scan_value & data$PID == pid_value, , drop = FALSE]
+    all_true <- disambiguate(subset_df, col_range_start, col_range_end)
+    data.frame(scan_number = scan_value, PID = pid_value, all_true = all_true)
+  })
+
+  do.call(rbind, results)
 }

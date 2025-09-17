@@ -1,3 +1,9 @@
+#' Modification column helpers
+#'
+#' Tools for expanding stored modification summaries into position/mass columns used by later localisation steps.
+#' @keywords internal
+NULL
+
 #' Populate modification columns from summary strings
 #'
 #' @param df Data frame containing a `modifications` column.
