@@ -1,3 +1,9 @@
+#' Nearest-site annotation helpers
+#'
+#' Routines that compute proximal candidate residues for each modification and record the rule set used.
+#' @keywords internal
+NULL
+
 #' Locate nearest candidate residues for modifications at K/R sites
 #'
 #' @param peptide Character vector of peptide sequences.

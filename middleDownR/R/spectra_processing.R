@@ -1,3 +1,28 @@
+#' Spectra processing helpers
+#'
+#' Utilities for turning mzML scans into analysis-ready data structures and for retrieving targeted signal intensities.
+#' @keywords internal
+NULL
+
+#' Process scans from an mzML file
+#'
+#' @param Scan_list Numeric or character vector of scan numbers to extract.
+#' @param mz An `mzR` object representing an mzML file.
+#'
+#' @return List of data frames containing m/z and intensity columns for each scan.
+#' @export
+process_scans_from_mzMLgz <- function(Scan_list, mz) {
+  mz_list <- list()
+
+  for (i in seq_along(Scan_list)) {
+    scan_number <- as.integer(Scan_list[[i]])
+    scan_data <- as.data.frame(mzR::peaks(mz, scan = scan_number))
+    mz_list[[as.character(scan_number)]] <- scan_data
+  }
+
+  mz_list
+}
+
 #' Locate intensities for target m/z values within a scan
 #'
 #' @param scan_number Scan number to inspect.
