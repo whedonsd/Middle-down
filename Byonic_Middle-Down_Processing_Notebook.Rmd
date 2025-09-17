@@ -42,7 +42,7 @@ library(writexl)
 library(tidyverse) # includes ggplot2, for data visualisation. dplyr, for data manipulation.
 library(RColorBrewer) # for a colourful plot
 library(ggrepel) # for nice annotations
-```
+
 stored_parameters <- list(
   max_mods = max_mods,
   PEP.2D = PEP,
@@ -282,8 +282,7 @@ Step-wise disambiguation
 Step 1: split up modifications data
 
 ```{r}
-# Assuming matches_data_df_w_mods already exists and has a 'modifications' column
-
+# Assumes that matches_data_df_w_mods already exists and has a 'modifications' column
 # Define fill_modifications_direct function to work directly on the dataframe
 # provided by middleDownR::fill_modifications_direct
 
@@ -318,6 +317,7 @@ fill_mods_results <- parLapply(cl, grouped_df_list, function(group) {
 # The method to combine results depends on the structure of your output
 matches_data_df_w_mods <- bind_rows(fill_mods_results)
 
+# Assumes that max_mods is set to 7, and in some searches no species with 7 mods will survive the preceding evaluation criteria; in these cases auto-generating columns for 6 and 7 mods prevents subsequent code from producing an error
 # provided by middleDownR::add_column_if_not_exists
 
 matches_data_df_w_mods <- add_column_if_not_exists(matches_data_df_w_mods, "mod_pos_6") 
@@ -331,9 +331,7 @@ Step-wise disambiguation
 Step 2: find nearest_before and nearest_after by modification type
 
 ```{r}
-# HELPER functions
-
-# Assuming max_mods is already defined as the maximum number of modifications you expect per peptide
+# Assumes max_mods is already defined as the maximum number of modifications you expect per peptide
 # For each modification, you want to add nearest_before_mod_n, nearest_after_mod_n, and nearest_fn
 
 # Add empty columns for nearest_before_mod_n, nearest_after_mod_n, and nearest_fn for each modification
@@ -343,12 +341,11 @@ for(i in 1:max_mods) {
   matches_data_df_w_mods[paste0("nearest_fn_mod_", i)] <- NA_character_
 }
 
-# Assuming you have a dataframe `matches_data_df_w_mods` with peptides, modification positions, and masses
-
+# Assumes you have a dataframe `matches_data_df_w_mods` with peptides, modification positions, and masses
 # Update the function to directly modify the dataframe
 # provided by middleDownR::apply_nearest_function_directly
-
 # Apply the function to your dataframe
+
 # Parallelization
 
 # Step 1: Group your dataframe by scan_number
@@ -385,13 +382,8 @@ Step-wise disambiguation
 Step 3: use ion identities to determine whether fragments fall between nearest_before and nearest_after
 
 ```{r}
-# Helper function
-
-#First, we need a function that assembles a_b_c_ions_df and y_z_ions_df for each scan_number and PID combination from matches_data_df_w_mods_updated. This will involve filtering the dataframe for each ion type and converting y and z ion positions.
+# First, we need a function that assembles a_b_c_ions_df and y_z_ions_df for each scan_number and PID combination from matches_data_df_w_mods_updated. This will involve filtering the dataframe for each ion type and converting y and z ion positions.
 # provided by middleDownR::assemble_ions_df
-
-# ions_result <- assemble_ions_df(matches_data_df_w_mods_updated, "983", "1")
-
 # provided by middleDownR::check_unambiguity_before
 # provided by middleDownR::check_unambiguity_after
 
@@ -404,23 +396,16 @@ matches_data_df_w_mods_updated <- matches_data_df_w_mods_updated %>%
                      yz_after_unambiguous = ~NA),
                 .names = "{.col}_{.fn}"))
 
-# Working function to apply ambiguity checks for each modification in a row
-# apply_ambiguity_checks provided by middleDownR::apply_ambiguity_checks
-
-
-# Make sure to pass the actual number of max_mods you have in your data
-# test_df <- apply_ambiguity_checks(df, max_mods)
-
-# Apply the checks
-# matches_data_df_w_mods_updated <- apply_ambiguity_checks(matches_data_df_w_mods_updated)
-
+# run the following to save and review the ambiguity check results
 # write_excel_csv(matches_data_df_w_mods_updated, "matches_data_df_w_mods_updated_ambiguity_check1")
 ```
 
-Parallelization
+Parallelization of ambiguity checks
 
 ```{r}
-detectCores()
+# This is usually slow
+# Working function to apply ambiguity checks for each modification in a row
+# apply_ambiguity_checks provided by middleDownR::apply_ambiguity_checks
 
 # Step 1: Group your dataframe by scan_number
 grouped_df_list <- matches_data_df_w_mods_updated %>% 
@@ -2323,6 +2308,7 @@ write_excel_csv(proteoform_df, file = file_name)
 file_name <- paste0("experiment1_proteoform_df_", save_name_RData_suffix)
 save(proteoform_df, file = file_name)
 ```
+
 
 
 
