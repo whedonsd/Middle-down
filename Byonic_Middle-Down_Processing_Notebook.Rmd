@@ -29,6 +29,45 @@ amino_acid_masses <- middleDownR:::amino_acid_masses
 atomic_masses <- middleDownR:::atomic_masses
 ion_type_adjustments <- middleDownR:::ion_type_adjustments
 
+cpu_usage_option <- if (!is.null(cfg$cpu_usage)) cfg$cpu_usage else "default"
+available_cpu_options <- names(cfg$cpu_usage_defaults)
+if (is.null(available_cpu_options)) {
+  available_cpu_options <- c("default", "high")
+}
+
+total_cores_available <- parallel::detectCores()
+if (is.null(total_cores_available) || is.na(total_cores_available) || total_cores_available < 1) {
+  total_cores_available <- 1L
+}
+total_cores_available <- as.integer(total_cores_available)
+
+resolve_num_cores <- function(option) {
+  normalized_option <- tolower(as.character(option[1]))
+  if (normalized_option == "high") {
+    return(max(1L, total_cores_available - 2L))
+  }
+  if (normalized_option == "default") {
+    return(max(1L, floor(total_cores_available / 2)))
+  }
+
+  numeric_option <- suppressWarnings(as.numeric(normalized_option))
+  if (!is.na(numeric_option)) {
+    cores <- as.integer(floor(numeric_option))
+    if (is.finite(cores) && cores >= 1L) {
+      return(min(cores, total_cores_available))
+    }
+  }
+
+  warning(sprintf(
+    "Unknown cpu_usage option '%s'. Available options: %s. Falling back to default setting.",
+    option[1],
+    paste(available_cpu_options, collapse = ", ")
+  ))
+  max(1L, floor(total_cores_available / 2))
+}
+
+numCores <- as.integer(resolve_num_cores(cpu_usage_option))
+
 library(parallel)
 library(purrr)
 library(mzR)
@@ -188,7 +227,6 @@ Byonic_list <- experiment1_list
 mz_list <- experiment1_mz_list
 
 # 1. Prepare List Chunks
-numCores <- detectCores() / 2  # Save some cores for system tasks
 chunks <- split(Byonic_list, cut(seq_along(Byonic_list), breaks = numCores, labels = FALSE))
 
 # 2. Execute in Parallel
@@ -241,7 +279,6 @@ Convert list to dataframe
 
 ```{r}
 # 1. Prepare Data Chunks
-numCores <- detectCores() / 2  # Save some cores for system tasks
 chunks <- split(matches_list, cut(seq_along(matches_list), breaks = numCores, labels = FALSE))
 
 total_chunk_length <- sum(sapply(chunks, length))
@@ -294,7 +331,6 @@ grouped_df_list <- matches_data_df %>%
   group_split()
 
 # Step 2: Prepare to use parallel processing
-numCores <- detectCores() / 2  # Reserve two cores for system tasks
 cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
@@ -354,7 +390,6 @@ grouped_df_list <- matches_data_df_w_mods %>%
   group_split()
 
 # Step 2: Prepare to use parallel processing
-numCores <- detectCores() / 2  # Reserve two cores for system tasks
 cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
@@ -413,7 +448,6 @@ grouped_df_list <- matches_data_df_w_mods_updated %>%
   group_split()
 
 # Step 2: Prepare to use parallel processing
-numCores <- detectCores() / 2  # Reserve two cores for system tasks
 cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
@@ -449,7 +483,6 @@ grouped_df_list <- combined_results %>%
   group_split()
 
 # Step 2: Prepare to use parallel processing
-numCores <- detectCores() / 2  # Reserve two cores for system tasks
 cl <- makeCluster(numCores)
 on.exit(stopCluster(cl), add = TRUE)
 
